@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from pandas import DataFrame
 import gc
-
+import wandb
 
 
 @dataclass
@@ -119,7 +119,7 @@ class Midcoder(nn.Module):
         pbar = tqdm(range(self.cfg.epochs))
         history = []
         
-        if log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
+        if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
         for _ in pbar:
             epoch = []
             for step in range(self.cfg.steps_per_epoch):
@@ -136,13 +136,13 @@ class Midcoder(nn.Module):
                 "loss": sum([loss for loss, _ in epoch]) / len(epoch),
                 "loss_norm": sum([loss_norm for  _, loss_norm in epoch]) / len(epoch),
             }
-            if log: wandb.log(metrics)
+            if self.cfg.log: wandb.log(metrics)
             history.append(metrics)
             pbar.set_description(', '.join(f"{k}: {v:.3f}" for k, v in metrics.items()))
 
             self.clear_cache()
         
-        if log: wandb.finish()
+        if self.cfg.log: wandb.finish()
         return DataFrame.from_records(history, columns=['loss', 'loss_norm'])
 
     def clear_cache(self):

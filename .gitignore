@@ -1,3 +1,2 @@
-__pycache__/midtranscoder.cpython-312.pyc
-__pycache__/midcoder.cpython-312.pyc
-__pycache__/utils.cpython-312.pyc
+__pycache__/
+wandb/
