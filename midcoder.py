@@ -8,6 +8,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from pandas import DataFrame
+import gc
 
 
 
@@ -18,9 +19,11 @@ class MidcoderConfig():
     seed: int = 42
     lr = 1e-3
     weight_decay = 1e-3
-    batch_size = 128
+    batch_size = 32
     steps_per_epoch = 10
     epochs = 100
+    log = True
+    wandb_project = 'midcoder'
 
     device = 'cuda'
     
@@ -37,7 +40,8 @@ class Midcoder(nn.Module):
         self.layer = layer
         self.cfg = cfg
         self.device = cfg.device
-        self.hook_point = model.blocks[layer].ln2.hook_normalized
+        self.pre_hook_point = model.blocks[layer].ln2.hook_normalized
+        self.post_hook_point = model.blocks[layer].hook_mlp_out
 
         torch.manual_seed(self.cfg.seed)
 
@@ -50,6 +54,8 @@ class Midcoder(nn.Module):
 
         self.W_in = self.model.blocks[self.layer].mlp.W_in.clone().detach()
         self.b_in = self.model.blocks[self.layer].mlp.b_in.clone().detach()
+        self.W_out = self.model.blocks[self.layer].mlp.W_out.clone().detach()
+        self.b_out = self.model.blocks[self.layer].mlp.b_out.clone().detach()
         
         n_feat = self.W_enc.shape[1]
         d_mlp = self.model.blocks[layer].mlp.W_in.shape[1]
@@ -68,22 +74,25 @@ class Midcoder(nn.Module):
         x = x @ self.W_enc + self.b_enc
         acts = torch.nn.functional.relu(x) #activations
         mid = acts @ self.W_mid + self.b_mid
-        return mid, acts
+        out = mid @ self.W_out + self.b_out
+        return out, mid, acts
     
     def get_inputs_outputs(self, token_array):
         #x: input to model of shape (batch, pos)
         with torch.no_grad():
             _, cache = self.model.run_with_cache(token_array, stop_at_layer=self.layer+1, 
-                                                names_filter=[self.hook_point.name])
-            inputs = cache[self.hook_point.name]
-            outputs = inputs @ self.W_in + self.b_in
+                                                names_filter=[self.pre_hook_point.name,
+                                                              self.post_hook_point.name])
+            inputs = cache[self.pre_hook_point.name]
+            outputs = cache[self.post_hook_point.name]
         return inputs, outputs
     
     def step(self, batch):
         inputs, outputs = self.get_inputs_outputs(batch)
-        mid, _ = self.forward(inputs)
-        loss = nn.MSELoss()(mid, outputs)
-        loss_norm = loss/(outputs.norm(dim=-1, keepdim=True)**2)
+        out, _, _ = self.forward(inputs)
+        loss = nn.MSELoss()(out, outputs)
+        scale = (outputs**2).mean()
+        loss_norm = loss/scale
         return loss, loss_norm
 
     def get_dataset(self):
@@ -110,12 +119,13 @@ class Midcoder(nn.Module):
         pbar = tqdm(range(self.cfg.epochs))
         history = []
         
+        if log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
         for _ in pbar:
             epoch = []
             for step in range(self.cfg.steps_per_epoch):
                 batch = next(dataloader)['tokens']
                 loss, loss_norm = self.train().step(batch)
-                epoch += [(loss.item, loss_norm.item)]
+                epoch += [(loss.item(), loss_norm.item())]
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -126,11 +136,20 @@ class Midcoder(nn.Module):
                 "loss": sum([loss for loss, _ in epoch]) / len(epoch),
                 "loss_norm": sum([loss_norm for  _, loss_norm in epoch]) / len(epoch),
             }
-            
+            if log: wandb.log(metrics)
             history.append(metrics)
             pbar.set_description(', '.join(f"{k}: {v:.3f}" for k, v in metrics.items()))
+
+            self.clear_cache()
         
+        if log: wandb.finish()
         return DataFrame.from_records(history, columns=['loss', 'loss_norm'])
 
+    def clear_cache(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
 
