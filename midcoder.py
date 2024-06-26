@@ -59,7 +59,7 @@ class Midcoder(nn.Module):
             ),
             requires_grad=True
         )
-        self.b_mid = nn.Parameter(torch.zeros(n_feat), requires_grad=True)
+        self.b_mid = nn.Parameter(torch.zeros(d_mlp,  device=self.device), requires_grad=True)
 
     def forward(self, x):
         #x: input into MLP of shape (batch, pos, d_model)
@@ -84,7 +84,7 @@ class Midcoder(nn.Module):
         inputs, outputs = self.get_inputs_outputs(batch)
         mid, _ = self.forward(inputs)
         loss = nn.MSELoss()(mid, outputs)
-        loss_norm = loss/(outputs.norm(dim=-1, keepdims=True)**2)
+        loss_norm = loss/(outputs.norm(dim=-1, keepdim=True)**2)
         return loss, loss_norm
 
     def get_dataset(self):
@@ -115,8 +115,8 @@ class Midcoder(nn.Module):
             epoch = []
             for step in range(self.cfg.steps_per_epoch):
                 batch = next(dataloader)['tokens']
-                loss, loss_norm= self.train().step(batch)
-                epoch += [(loss, loss_norm.item)]
+                loss, loss_norm = self.train().step(batch)
+                epoch += [(loss.item, loss_norm.item)]
                 
                 optimizer.zero_grad()
                 loss.backward()
