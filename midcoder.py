@@ -72,12 +72,11 @@ class Midcoder(nn.Module):
     
     def get_inputs_outputs(self, token_array):
         #x: input to model of shape (batch, pos)
-
-        _, cache = self.model.run_with_cache(token_array, stop_at_layer=self.layer+1, 
-                                             names_filter=[self.hook_point.name])
-        inputs = cache[self.hook_point.name]
-        
-        outputs = inputs @ self.W_in + self.b_in
+        with torch.no_grad():
+            _, cache = self.model.run_with_cache(token_array, stop_at_layer=self.layer+1, 
+                                                names_filter=[self.hook_point.name])
+            inputs = cache[self.hook_point.name]
+            outputs = inputs @ self.W_in + self.b_in
         return inputs, outputs
     
     def step(self, batch):
