@@ -4,6 +4,7 @@ from datasets import load_dataset
 from dataclasses import dataclass
 from utils import tokenize_and_concatenate
 from tqdm import tqdm
+import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -11,6 +12,8 @@ from pandas import DataFrame
 import gc
 import wandb
 from functools import partial
+from einops import *
+
 
 
 @dataclass
@@ -22,70 +25,71 @@ class MidcoderConfig():
     weight_decay = 1e-3
     batch_size = 32
     steps_per_epoch = 10
-    epochs = 100
+    train_tokens = 1_000_000
     log = True
     wandb_project = 'midcoder'
-
-    device = 'cuda'
-    
+    device = 'cuda'    
     
 class Midcoder(nn.Module):
     # finds the mid vectors (pre-ReLU feature vectors) 
     # for a previously trained transcoder
     # based on jacobdunefsky/transcoder_circuits and pchlenski/gpt2-transcoders
 
-    def __init__(self, model, transcoder, layer, cfg: MidcoderConfig):
+    def __init__(self, models, layer, cfg: MidcoderConfig):
         super().__init__()
-        self.model = model
-        self.transcoder = transcoder
+        # models: dict of {'model': HookedTransformer, 'transcoder':SparseAutoencoder} to avoid parameters being added
+        self.models = models
         self.layer = layer
         self.cfg = cfg
         self.device = cfg.device
-        self.pre_hook_point = model.blocks[layer].ln2.hook_normalized
-        self.post_hook_point = model.blocks[layer].hook_mlp_out
+        self.pre_hook_point = models['model'].blocks[layer].ln2.hook_normalized
+        self.post_hook_point = models['model'].blocks[layer].hook_mlp_out
 
         torch.manual_seed(self.cfg.seed)
 
         # transcoder weights
-        self.b_dec = self.transcoder.b_dec.clone().detach()
-        self.W_enc = self.transcoder.W_enc.clone().detach()
-        self.b_enc = self.transcoder.b_enc.clone().detach()
-        self.W_dec = self.transcoder.W_dec.clone().detach()
-        self.b_dec_out = self.transcoder.b_dec_out.clone().detach()
+        self.b_dec = models['transcoder'].b_dec.clone().detach()
+        self.W_enc = models['transcoder'].W_enc.clone().detach()
+        self.b_enc = models['transcoder'].b_enc.clone().detach()
+        self.W_dec = models['transcoder'].W_dec.clone().detach()
+        self.b_dec_out = models['transcoder'].b_dec_out.clone().detach()
 
-        self.W_in = self.model.blocks[self.layer].mlp.W_in.clone().detach()
-        self.b_in = self.model.blocks[self.layer].mlp.b_in.clone().detach()
-        self.W_out = self.model.blocks[self.layer].mlp.W_out.clone().detach()
-        self.b_out = self.model.blocks[self.layer].mlp.b_out.clone().detach()
+        self.W_in = models['model'].blocks[self.layer].mlp.W_in.clone().detach()
+        self.b_in = models['model'].blocks[self.layer].mlp.b_in.clone().detach()
+        self.W_out = models['model'].blocks[self.layer].mlp.W_out.clone().detach()
+        self.b_out = models['model'].blocks[self.layer].mlp.b_out.clone().detach()
         
         n_feat = self.W_enc.shape[1]
-        d_mlp = self.model.blocks[layer].mlp.W_in.shape[1]
-        #TODO: add better initialization as W_out.inv @ W_dec
+        d_model, d_mlp = models['model'].blocks[layer].mlp.W_in.shape
         self.W_mid = nn.Parameter(
-            torch.nn.init.kaiming_uniform_(
-                torch.empty(n_feat, d_mlp, device=self.device)
-            ),
+            # self.W_dec @ torch.linalg.pinv(self.W_in @ self.W_out),
+            torch.nn.init.kaiming_uniform_(torch.empty(n_feat, d_model, device=self.device)),
             requires_grad=True
         )
-        self.b_mid = nn.Parameter(torch.zeros(d_mlp,  device=self.device), requires_grad=True)
+        self.b_mid = nn.Parameter(
+                        torch.zeros(d_model,  device=self.device), 
+                        requires_grad=True)
 
-        self.neuron_patterns = torch.zeros((n_feat, d_mlp), device=self.device)
-        self.act_counts = torch.zeros((n_feat, d_mlp), device=self.device)
+        self.neuron_act_counts = nn.Parameter(
+                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.act_counts = nn.Parameter(torch.zeros((n_feat), device=self.device), requires_grad = False)
 
     def forward(self, inputs):
         #inputs: input into MLP of shape (batch, pos, d_model)
         x = inputs.to(self.device)
         x = x - self.b_dec
-        x = x @ self.W_enc + self.b_enc
-        acts = torch.nn.functional.relu(x) #activations
+        acts = torch.nn.functional.relu(x @ self.W_enc + self.b_enc) #activations
         mid = acts @ self.W_mid + self.b_mid
-        out = mid @ self.W_out + self.b_out
-        return out, mid, acts
+
+        relu_out = torch.nn.functional.relu(mid @ self.W_in + self.b_in)
+        mlp_out = relu_out @ self.W_out + self.b_out
+        return mlp_out, relu_out, acts
     
     def get_inputs_outputs(self, token_array):
         #x: input to model of shape (batch, pos)
         with torch.no_grad():
-            _, cache = self.model.run_with_cache(token_array, stop_at_layer=self.layer+1, 
+            _, cache = self.models['model'].run_with_cache(token_array, stop_at_layer=self.layer+1, 
                                                 names_filter=[self.pre_hook_point.name,
                                                               self.post_hook_point.name])
             inputs = cache[self.pre_hook_point.name]
@@ -94,8 +98,8 @@ class Midcoder(nn.Module):
     
     def step(self, batch):
         inputs, outputs = self.get_inputs_outputs(batch)
-        out, _, _ = self.forward(inputs)
-        loss = nn.MSELoss()(out, outputs)
+        mlp_out, _, _ = self.forward(inputs)
+        loss = nn.MSELoss()(mlp_out, outputs)
         scale = (outputs**2).mean()
         loss_norm = loss/scale
         return loss, loss_norm
@@ -103,8 +107,8 @@ class Midcoder(nn.Module):
     def get_dataset(self):
         dataset = load_dataset('Skylion007/openwebtext', split='train', streaming=True,
                                 trust_remote_code=True)
-        dataset = dataset.shuffle(seed=42, buffer_size=10_000)
-        tokenized_dataset = tokenize_and_concatenate(dataset, self.model.tokenizer, 
+        dataset = dataset.shuffle(seed=self.cfg.seed, buffer_size=10_000)
+        tokenized_dataset = tokenize_and_concatenate(dataset, self.models['model'].tokenizer, 
                             max_length=self.cfg.context_length, streaming=True
                             )
         return tokenized_dataset
@@ -117,11 +121,12 @@ class Midcoder(nn.Module):
     
     def fit(self):        
         optimizer = AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=self.cfg.epochs)
+        num_epochs = int(self.cfg.train_tokens/(self.cfg.context_length * self.cfg.batch_size * self.cfg.steps_per_epoch)) + 1
+        scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
         
         dataloader = self.get_dataloader()
         
-        pbar = tqdm(range(self.cfg.epochs))
+        pbar = tqdm(range(num_epochs))
         history = []
         
         if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
@@ -163,9 +168,9 @@ class Midcoder(nn.Module):
                 inputs, outputs = self.get_inputs_outputs(batch)
 
 
-                mid_out, _, acts = self.eval().forward(inputs)
+                mid_out, relu_out, acts = self.eval().forward(inputs)
                 trans_out = acts @ self.W_dec + self.b_dec_out
-                self.update_neuron_patterns(inputs, acts)
+                self.update_neuron_patterns(relu_out, acts)
 
                 loss, mid_loss, trans_loss = self.get_reconstruction_losses(batch,
                                                                             mid_out,
@@ -175,7 +180,7 @@ class Midcoder(nn.Module):
                 trans_mse_loss = nn.MSELoss()(trans_out, outputs)
 
                 epoch += [(loss.item(), mid_loss.item(), trans_loss.item(),
-                          mid_mse_loss, trans_mse_loss)]
+                          mid_mse_loss.item(), trans_mse_loss.item())]
                 self.clear_cache()
         metrics = {
             "loss": sum([step[0] for step in epoch]) / len(epoch),
@@ -189,43 +194,41 @@ class Midcoder(nn.Module):
     def get_reconstruction_losses(self, batch, mid_out, trans_out):
         with torch.no_grad():
             hook_point = self.post_hook_point.name
-            loss = self.model(batch, return_type = "loss").mean()
+            loss = self.models['model'](batch, return_type = "loss").mean()
             self.clear_cache()
 
             def replacement_hook(activations, hook):
                 return mid_out
-            mid_loss = self.model.run_with_hooks(
+            mid_loss = self.models['model'].run_with_hooks(
                 batch,
                 return_type="loss",
                 fwd_hooks=[(hook_point, partial(replacement_hook))],
             ).mean()
-            self.model.reset_hooks()
+            self.models['model'].reset_hooks()
             self.clear_cache()
 
             def replacement_hook(activations, hook):
                 return trans_out
-            trans_loss = self.model.run_with_hooks(
+            trans_loss = self.models['model'].run_with_hooks(
                 batch,
                 return_type="loss",
                 fwd_hooks=[(hook_point, partial(replacement_hook))],
             ).mean()
-            self.model.reset_hooks()
+            self.models['model'].reset_hooks()
             self.clear_cache()
 
         return loss, mid_loss, trans_loss
 
-    def update_neuron_patterns(self, inputs, acts):
+    @torch.no_grad()
+    def update_neuron_patterns(self, relu_out, acts):
         # inputs: (batch, pos, d_model)
         # acts: (batch, pos, n_feat)
-        pattern = (inputs @ self.W_in + self.b_in > 0).float() #(batch, pos, d_mlp)
-        summed_pattern = einsum(pattern, (acts > 0).float(), "b pos d, b pos f -> f d")
-        new_counts = self.act_counts+summed_pattern
-        self.neuron_patterns = (self.act_counts/new_counts) * self.neuron_patterns + summed_pattern/new_counts
-        self.act_counts += summed_pattern
+        self.neuron_act_counts += einsum(relu_out > 0, acts > 0, "b pos d, b pos f -> f d")
+        self.act_counts += einsum(acts > 0, "b pos f -> f")
         
     def save_weights(self, path):
-        weights = {key: midcoder.state_dict()[key] for key in ['W_mid', 'b_mid']}
-        torch.save(weights, path)
+        data = [self.state_dict(), self.cfg]
+        torch.save(self.state_dict(), path)
 
     def load_weights(self, path, **kwargs):
         #assumes weights are first item in list
