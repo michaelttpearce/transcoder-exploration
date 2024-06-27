@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from pandas import DataFrame
 import gc
 import wandb
+from functools import partial
 
 
 @dataclass
@@ -59,6 +60,7 @@ class Midcoder(nn.Module):
         
         n_feat = self.W_enc.shape[1]
         d_mlp = self.model.blocks[layer].mlp.W_in.shape[1]
+        #TODO: add better initialization as W_out.inv @ W_dec
         self.W_mid = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(n_feat, d_mlp, device=self.device)
@@ -67,9 +69,12 @@ class Midcoder(nn.Module):
         )
         self.b_mid = nn.Parameter(torch.zeros(d_mlp,  device=self.device), requires_grad=True)
 
-    def forward(self, x):
-        #x: input into MLP of shape (batch, pos, d_model)
-        x = x.to(self.device)
+        self.neuron_patterns = torch.zeros((n_feat, d_mlp), device=self.device)
+        self.act_counts = torch.zeros((n_feat, d_mlp), device=self.device)
+
+    def forward(self, inputs):
+        #inputs: input into MLP of shape (batch, pos, d_model)
+        x = inputs.to(self.device)
         x = x - self.b_dec
         x = x @ self.W_enc + self.b_enc
         acts = torch.nn.functional.relu(x) #activations
@@ -148,7 +153,7 @@ class Midcoder(nn.Module):
 
     def evaluate(self, tokens=2e6):
         dataloader = self.get_dataloader()
-        steps = tokens//(self.cfg.context_length * self.cfg.batch_size)
+        steps = int(tokens/(self.cfg.context_length * self.cfg.batch_size))
         pbar = tqdm(range(steps))
         
         epoch = []
@@ -156,8 +161,11 @@ class Midcoder(nn.Module):
             with torch.no_grad():
                 batch = next(dataloader)['tokens']
                 inputs, outputs = self.get_inputs_outputs(batch)
+
+
                 mid_out, _, acts = self.eval().forward(inputs)
                 trans_out = acts @ self.W_dec + self.b_dec_out
+                self.update_neuron_patterns(inputs, acts)
 
                 loss, mid_loss, trans_loss = self.get_reconstruction_losses(batch,
                                                                             mid_out,
@@ -168,6 +176,7 @@ class Midcoder(nn.Module):
 
                 epoch += [(loss.item(), mid_loss.item(), trans_loss.item(),
                           mid_mse_loss, trans_mse_loss)]
+                self.clear_cache()
         metrics = {
             "loss": sum([step[0] for step in epoch]) / len(epoch),
             "loss_mid": sum([step[1] for step in epoch]) / len(epoch),
@@ -178,39 +187,50 @@ class Midcoder(nn.Module):
         return metrics
 
     def get_reconstruction_losses(self, batch, mid_out, trans_out):
-        hook_point = self.post_hook_point
-        loss = self.model(batch, return_type = "loss").mean()
+        with torch.no_grad():
+            hook_point = self.post_hook_point.name
+            loss = self.model(batch, return_type = "loss").mean()
+            self.clear_cache()
 
-        def replacement_hook(activations, hook):
-            return mid_out
-        mid_loss = self.model.run_with_hooks(
-            batch,
-            return_type="loss",
-            fwd_hooks=[(hook_point, partial(replacement_hook))],
-        ).mean()
-        model.reset_hooks()
+            def replacement_hook(activations, hook):
+                return mid_out
+            mid_loss = self.model.run_with_hooks(
+                batch,
+                return_type="loss",
+                fwd_hooks=[(hook_point, partial(replacement_hook))],
+            ).mean()
+            self.model.reset_hooks()
+            self.clear_cache()
 
-        def replacement_hook(activations, hook):
-            return trans_out
-        trans_loss = self.model.run_with_hooks(
-            batch,
-            return_type="loss",
-            fwd_hooks=[(hook_point, partial(replacement_hook))],
-        ).mean()
-        model.reset_hooks()
+            def replacement_hook(activations, hook):
+                return trans_out
+            trans_loss = self.model.run_with_hooks(
+                batch,
+                return_type="loss",
+                fwd_hooks=[(hook_point, partial(replacement_hook))],
+            ).mean()
+            self.model.reset_hooks()
+            self.clear_cache()
 
         return loss, mid_loss, trans_loss
+
+    def update_neuron_patterns(self, inputs, acts):
+        # inputs: (batch, pos, d_model)
+        # acts: (batch, pos, n_feat)
+        pattern = (inputs @ self.W_in + self.b_in > 0).float() #(batch, pos, d_mlp)
+        summed_pattern = einsum(pattern, (acts > 0).float(), "b pos d, b pos f -> f d")
+        new_counts = self.act_counts+summed_pattern
+        self.neuron_patterns = (self.act_counts/new_counts) * self.neuron_patterns + summed_pattern/new_counts
+        self.act_counts += summed_pattern
         
-
-
     def save_weights(self, path):
         weights = {key: midcoder.state_dict()[key] for key in ['W_mid', 'b_mid']}
         torch.save(weights, path)
 
-    def load_weights(self, path):
+    def load_weights(self, path, **kwargs):
         #assumes weights are first item in list
         data = torch.load(path)
-        self.load_state_dict(data[0])
+        self.load_state_dict(data[0], **kwargs)
 
     def clear_cache(self):
         gc.collect()
@@ -218,26 +238,3 @@ class Midcoder(nn.Module):
             torch.cuda.empty_cache()
         elif torch.backends.mps.is_available():
             torch.mps.empty_cache()
-
-
-def evaluate_midcoder(midcoder, tokens = 2e6):
-    cfg = midcoder.cfg
-    dataloader = midcoder.get_dataloader()
-    steps = tokens//(cfg.context_length * cfg.batch_size)
-    pbar = tqdm(range(steps))
-    
-    for _ in pbar:
-        with torch.no_grad():
-            batch = next(dataloader)['tokens']
-            loss, loss_norm = self.eval().step(batch)
-            
-        
-        metrics = {
-            "loss": sum([loss for loss, _ in epoch]) / len(epoch),
-            "loss_norm": sum([loss_norm for  _, loss_norm in epoch]) / len(epoch),
-        }
-        if self.cfg.log: wandb.log(metrics)
-        history.append(metrics)
-        pbar.set_description(', '.join(f"{k}: {v:.3f}" for k, v in metrics.items()))
-
-        self.clear_cache()
