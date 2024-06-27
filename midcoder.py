@@ -135,15 +135,82 @@ class Midcoder(nn.Module):
             metrics = {
                 "loss": sum([loss for loss, _ in epoch]) / len(epoch),
                 "loss_norm": sum([loss_norm for  _, loss_norm in epoch]) / len(epoch),
+                "lr": scheduler.get_last_lr()[0]
             }
             if self.cfg.log: wandb.log(metrics)
             history.append(metrics)
-            pbar.set_description(', '.join(f"{k}: {v:.3f}" for k, v in metrics.items()))
+            pbar.set_description(', '.join(f"{k}: {v:.3e}" for k, v in metrics.items()))
 
             self.clear_cache()
         
         if self.cfg.log: wandb.finish()
         return DataFrame.from_records(history, columns=['loss', 'loss_norm'])
+
+    def evaluate(self, tokens=2e6):
+        dataloader = self.get_dataloader()
+        steps = tokens//(self.cfg.context_length * self.cfg.batch_size)
+        pbar = tqdm(range(steps))
+        
+        epoch = []
+        for _ in pbar:
+            with torch.no_grad():
+                batch = next(dataloader)['tokens']
+                inputs, outputs = self.get_inputs_outputs(batch)
+                mid_out, _, acts = self.eval().forward(inputs)
+                trans_out = acts @ self.W_dec + self.b_dec_out
+
+                loss, mid_loss, trans_loss = self.get_reconstruction_losses(batch,
+                                                                            mid_out,
+                                                                            trans_out
+                                                                            )
+                mid_mse_loss = nn.MSELoss()(mid_out, outputs)
+                trans_mse_loss = nn.MSELoss()(trans_out, outputs)
+
+                epoch += [(loss.item(), mid_loss.item(), trans_loss.item(),
+                          mid_mse_loss, trans_mse_loss)]
+        metrics = {
+            "loss": sum([step[0] for step in epoch]) / len(epoch),
+            "loss_mid": sum([step[1] for step in epoch]) / len(epoch),
+            "loss_trans": sum([step[2] for step in epoch]) / len(epoch),
+            "mse_loss_mid": sum([step[3] for step in epoch]) / len(epoch),
+            "mse_loss_trans": sum([step[4] for step in epoch]) / len(epoch),
+        }
+        return metrics
+
+    def get_reconstruction_losses(self, batch, mid_out, trans_out):
+        hook_point = self.post_hook_point
+        loss = self.model(batch, return_type = "loss").mean()
+
+        def replacement_hook(activations, hook):
+            return mid_out
+        mid_loss = self.model.run_with_hooks(
+            batch,
+            return_type="loss",
+            fwd_hooks=[(hook_point, partial(replacement_hook))],
+        ).mean()
+        model.reset_hooks()
+
+        def replacement_hook(activations, hook):
+            return trans_out
+        trans_loss = self.model.run_with_hooks(
+            batch,
+            return_type="loss",
+            fwd_hooks=[(hook_point, partial(replacement_hook))],
+        ).mean()
+        model.reset_hooks()
+
+        return loss, mid_loss, trans_loss
+        
+
+
+    def save_weights(self, path):
+        weights = {key: midcoder.state_dict()[key] for key in ['W_mid', 'b_mid']}
+        torch.save(weights, path)
+
+    def load_weights(self, path):
+        #assumes weights are first item in list
+        data = torch.load(path)
+        self.load_state_dict(data[0])
 
     def clear_cache(self):
         gc.collect()
@@ -153,3 +220,24 @@ class Midcoder(nn.Module):
             torch.mps.empty_cache()
 
 
+def evaluate_midcoder(midcoder, tokens = 2e6):
+    cfg = midcoder.cfg
+    dataloader = midcoder.get_dataloader()
+    steps = tokens//(cfg.context_length * cfg.batch_size)
+    pbar = tqdm(range(steps))
+    
+    for _ in pbar:
+        with torch.no_grad():
+            batch = next(dataloader)['tokens']
+            loss, loss_norm = self.eval().step(batch)
+            
+        
+        metrics = {
+            "loss": sum([loss for loss, _ in epoch]) / len(epoch),
+            "loss_norm": sum([loss_norm for  _, loss_norm in epoch]) / len(epoch),
+        }
+        if self.cfg.log: wandb.log(metrics)
+        history.append(metrics)
+        pbar.set_description(', '.join(f"{k}: {v:.3f}" for k, v in metrics.items()))
+
+        self.clear_cache()
