@@ -192,7 +192,7 @@ class Midcoder(nn.Module):
         steps = int(tokens/(self.cfg.context_length * self.cfg.batch_size))+1
         pbar = tqdm(range(steps))
 
-        self.set_avg_input_output_quants():
+        self.set_avg_input_output_quants()
         
         epoch = []
         for _ in pbar:
