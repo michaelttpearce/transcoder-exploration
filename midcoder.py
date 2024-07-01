@@ -258,6 +258,14 @@ class Midcoder(nn.Module):
         self.act_sum = nn.Parameter(
                                     torch.zeros((n_feat), device=self.device),
                                     requires_grad = False)
+
+        self.act_sq_gate_sum = nn.Parameter(
+                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.act_sq_sum = nn.Parameter(
+                                    torch.zeros((n_feat), device=self.device),
+                                    requires_grad = False)
+
         self.neuron_act_counts = nn.Parameter(
                                     torch.zeros((n_feat, d_mlp), device=self.device),
                                     requires_grad = False)
@@ -269,6 +277,10 @@ class Midcoder(nn.Module):
         # acts: (batch, pos, n_feat)
         self.act_gate_sum += einsum((relu_out > 0).float(), acts,"b pos d, b pos f -> f d")
         self.act_sum += einsum(acts, "b pos f -> f")
+
+        self.act_sq_gate_sum += einsum((relu_out > 0).float(), acts**2,"b pos d, b pos f -> f d")
+        self.act_sq_sum += einsum(acts**2, "b pos f -> f")
+
         self.neuron_act_counts += einsum((relu_out > 0).float(), (acts > 0).float(),"b pos d, b pos f -> f d")
         self.act_counts += einsum((acts > 0).float(), "b pos f -> f")
         
