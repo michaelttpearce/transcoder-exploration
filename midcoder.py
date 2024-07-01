@@ -88,10 +88,7 @@ class Midcoder(nn.Module):
         self.b_mid_out = nn.Parameter(torch.zeros(d_model, device=self.device),
                                         requires_grad=True)
 
-        self.neuron_act_counts = nn.Parameter(
-                                    torch.zeros((n_feat, d_mlp), device=self.device),
-                                    requires_grad = False)
-        self.act_counts = nn.Parameter(torch.zeros((n_feat), device=self.device), requires_grad = False)
+        self.initialize_saved_values()
 
     def forward(self, inputs):
         #inputs: input into MLP of shape (batch, pos, d_model)
@@ -125,7 +122,7 @@ class Midcoder(nn.Module):
         mlp_out_trans = acts @ self.W_dec + self.b_dec_out
 
         if self.training:
-            self.update_neuron_patterns(relu_out, acts)
+            self.update_saved_values(relu_out, acts)
 
         mse_mid = nn.MSELoss()(mid, inputs @ self.W_in + self.b_in)
         mse_out = nn.MSELoss()(mlp_out, outputs)
@@ -253,10 +250,25 @@ class Midcoder(nn.Module):
 
         return loss, mid_loss, trans_loss
 
+
+    def initialize_saved_values(self):
+        self.act_gate_sum = nn.Parameter(
+                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.act_sum = nn.Parameter(
+                                    torch.zeros((n_feat), device=self.device),
+                                    requires_grad = False)
+        self.neuron_act_counts = nn.Parameter(
+                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.act_counts = nn.Parameter(torch.zeros((n_feat), device=self.device), requires_grad = False)
+        
     @torch.no_grad()
-    def update_neuron_patterns(self, relu_out, acts):
+    def update_saved_values(self, relu_out, acts):
         # relu_out: (batch, pos, d_mlp)
         # acts: (batch, pos, n_feat)
+        self.act_gate_sum += einsum((relu_out > 0).float(), acts,"b pos d, b pos f -> f d")
+        self.act_sum += einsum(acts, "b pos f -> f")
         self.neuron_act_counts += einsum((relu_out > 0).float(), (acts > 0).float(),"b pos d, b pos f -> f d")
         self.act_counts += einsum((acts > 0).float(), "b pos f -> f")
         
