@@ -19,7 +19,7 @@ from einops import *
 @dataclass
 class MidcoderConfig():
     context_length = 128
-    mid_dim = 'd_mlp'
+    mid_dim = 'd_model'
     mse_out_param = 1
 
     seed: int = 42
@@ -88,7 +88,7 @@ class Midcoder(nn.Module):
         self.b_mid_out = nn.Parameter(torch.zeros(d_model, device=self.device),
                                         requires_grad=True)
 
-        self.initialize_saved_values()
+        self.initialize_saved_values(n_feat, d_model, d_mlp)
 
     def forward(self, inputs):
         #inputs: input into MLP of shape (batch, pos, d_model)
@@ -191,13 +191,15 @@ class Midcoder(nn.Module):
         dataloader = self.get_dataloader()
         steps = int(tokens/(self.cfg.context_length * self.cfg.batch_size))+1
         pbar = tqdm(range(steps))
+
+        self.set_avg_input_output_quants():
         
         epoch = []
         for _ in pbar:
             with torch.no_grad():
                 batch = next(dataloader)['tokens']
                 inputs, outputs = self.get_inputs_outputs(batch)
-
+                self.add_avg_input_output_quants(inputs, outputs)
 
                 mlp_out, relu_out, mid, acts = self.forward(inputs)
                 mlp_out_trans = acts @ self.W_dec + self.b_dec_out
@@ -212,6 +214,8 @@ class Midcoder(nn.Module):
                 epoch += [(loss.item(), mid_loss.item(), trans_loss.item(),
                           mse_mid.item(), mse_out.item(), mse_out_trans)]
                 self.clear_cache()
+
+        self.normalize_input_output_quants()
         metrics = {
             "ce_loss": sum([step[0] for step in epoch]) / len(epoch),
             "ce_loss_mid": sum([step[1] for step in epoch]) / len(epoch),
@@ -251,7 +255,7 @@ class Midcoder(nn.Module):
         return loss, mid_loss, trans_loss
 
 
-    def initialize_saved_values(self):
+    def initialize_saved_values(self, n_feat, d_model, d_mlp):
         self.act_gate_sum = nn.Parameter(
                                     torch.zeros((n_feat, d_mlp), device=self.device),
                                     requires_grad = False)
@@ -283,6 +287,49 @@ class Midcoder(nn.Module):
 
         self.neuron_act_counts += einsum((relu_out > 0).float(), (acts > 0).float(),"b pos d, b pos f -> f d")
         self.act_counts += einsum((acts > 0).float(), "b pos f -> f")
+
+    def set_avg_input_output_quants(self):
+        d_model, d_mlp = self.W_in.shape
+        self.pre_relu_mean = nn.Parameter(
+                                    torch.zeros((d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.pre_relu_cov = nn.Parameter(
+                                    torch.zeros((d_mlp, d_mlp), device=self.device),
+                                    requires_grad = False)
+
+        self.pre_relu_cube = nn.Parameter(
+                                    torch.zeros((d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.mlp_out_mean = nn.Parameter(
+                                    torch.zeros((d_model), device=self.device),
+                                    requires_grad = False)
+        self.mlp_out_cov = nn.Parameter(
+                                    torch.zeros((d_model), device=self.device),
+                                    requires_grad = False)
+
+        self.quant_count = nn.Parameter(
+                                    torch.zeros((1), device=self.device),
+                                    requires_grad = False)
+
+
+    def add_avg_input_output_quants(self, inputs, outputs):
+        pre_relu = inputs @ W_in + b_in
+        self.pre_relu_mean += einsum(pre_relu, "b pos d -> d")
+        self.pre_relu_cov += einsum(pre_relu, pre_relu, "b pos d1, b pos d2 -> d1 d2")
+        self.pre_relu_cube += einsum(pre_relu**3, "b pos d -> d")
+
+        self.mlp_out_mean += einsum(outputs, "b pos d -> d")
+        self.mlp_out_cov += einsum(outputs, outputs, "b pos d1, b pos d2 -> d1 d2")
+        
+        self.quant_count += 1
+
+    def normalize_input_output_quants(self):
+        self.pre_relu_mean /= self.quant_count
+        self.pre_relu_cov /= self.quant_count
+        self.pre_relu_cube /= self.quant_count
+        self.mlp_out_mean /= self.quant_count
+        self.mlp_out_cov /= self.quant_count
+
         
     def save_weights(self, path):
         data = {'weights': self.state_dict(), 
