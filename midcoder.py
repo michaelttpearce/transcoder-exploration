@@ -101,10 +101,11 @@ class Midcoder(nn.Module):
             mid = mid @ self.W_in + self.b_in
         elif self.cfg.mid_dim == 'd_mlp':
             mid = acts @ self.W_mid + self.b_mid
-        relu_out = torch.nn.functional.relu(mid)
+        gate = (mid > 0).float()
         # mlp_out = relu_out @ self.W_out + self.b_out
-        mlp_out = relu_out @ self.W_out + self.b_mid_out
-        return mlp_out, relu_out, mid, acts
+        # mlp_out = (gate * mid) @ self.W_out + self.b_mid_out
+        mlp_out = (gate * (acts @ self.W_mid)) @ self.W_out + self.b_mid_out
+        return mlp_out, gate, mid, acts
     
     def get_inputs_outputs(self, token_array):
         #x: input to model of shape (batch, pos)
@@ -118,11 +119,11 @@ class Midcoder(nn.Module):
     
     def step(self, batch):
         inputs, outputs = self.get_inputs_outputs(batch)
-        mlp_out, relu_out, mid, acts = self.forward(inputs)
+        mlp_out, gate, mid, acts = self.forward(inputs)
         mlp_out_trans = acts @ self.W_dec + self.b_dec_out
 
         if self.training:
-            self.update_saved_values(relu_out, acts)
+            self.update_saved_values(gate, acts, inputs, outputs)
 
         mse_mid = nn.MSELoss()(mid, inputs @ self.W_in + self.b_in)
         mse_out = nn.MSELoss()(mlp_out, outputs)
@@ -199,13 +200,13 @@ class Midcoder(nn.Module):
             with torch.no_grad():
                 batch = next(dataloader)['tokens']
                 inputs, outputs = self.get_inputs_outputs(batch)
-                self.add_avg_input_output_quants(inputs, outputs)
+                # self.add_avg_input_output_quants(inputs, outputs)
 
                 mlp_out, relu_out, mid, acts = self.forward(inputs)
                 mlp_out_trans = acts @ self.W_dec + self.b_dec_out
                 loss, mid_loss, trans_loss = self.get_reconstruction_losses(batch,
-                                                                            mid_out,
-                                                                            trans_out
+                                                                            mlp_out,
+                                                                            mlp_out_trans
                                                                             )
                 mse_mid = nn.MSELoss()(mid, inputs @ self.W_in + self.b_in)
                 mse_out = nn.MSELoss()(mlp_out, outputs)
@@ -222,14 +223,15 @@ class Midcoder(nn.Module):
             "ce_loss_trans": sum([step[2] for step in epoch]) / len(epoch),
             "mse_mid": sum([step[3] for step in epoch]) / len(epoch),
             "mse_out": sum([step[4] for step in epoch]) / len(epoch),
-            "mse_out_trans": sum([step[4] for step in epoch]) / len(epoch),
+            "mse_out_trans": sum([step[5] for step in epoch]) / len(epoch),
         }
         return metrics
 
     def get_reconstruction_losses(self, batch, mid_out, trans_out):
         with torch.no_grad():
             hook_point = self.post_hook_point.name
-            loss = self.models['model'](batch, return_type = "loss").mean()
+            loss = self.models['model'](batch, return_type = "loss").detach().mean()
+            self.models['model'].reset_hooks()
             self.clear_cache()
 
             def replacement_hook(activations, hook):
@@ -238,7 +240,8 @@ class Midcoder(nn.Module):
                 batch,
                 return_type="loss",
                 fwd_hooks=[(hook_point, partial(replacement_hook))],
-            ).mean()
+                clear_contexts = True
+            ).detach().mean()
             self.models['model'].reset_hooks()
             self.clear_cache()
 
@@ -248,8 +251,10 @@ class Midcoder(nn.Module):
                 batch,
                 return_type="loss",
                 fwd_hooks=[(hook_point, partial(replacement_hook))],
-            ).mean()
+                clear_contexts = True
+            ).detach().mean()
             self.models['model'].reset_hooks()
+
             self.clear_cache()
 
         return loss, mid_loss, trans_loss
@@ -270,28 +275,18 @@ class Midcoder(nn.Module):
                                     torch.zeros((n_feat), device=self.device),
                                     requires_grad = False)
 
-        self.neuron_act_counts = nn.Parameter(
+        self.gate_act_counts = nn.Parameter(
                                     torch.zeros((n_feat, d_mlp), device=self.device),
                                     requires_grad = False)
+        self.gate_counts = nn.Parameter(torch.zeros((d_mlp), device=self.device), requires_grad = False)
         self.act_counts = nn.Parameter(torch.zeros((n_feat), device=self.device), requires_grad = False)
+        self.counts = nn.Parameter(torch.zeros((1), device=self.device), requires_grad = False)
         
-    @torch.no_grad()
-    def update_saved_values(self, relu_out, acts):
-        # relu_out: (batch, pos, d_mlp)
-        # acts: (batch, pos, n_feat)
-        self.act_gate_sum += einsum((relu_out > 0).float(), acts,"b pos d, b pos f -> f d")
-        self.act_sum += einsum(acts, "b pos f -> f")
-
-        self.act_sq_gate_sum += einsum((relu_out > 0).float(), acts**2,"b pos d, b pos f -> f d")
-        self.act_sq_sum += einsum(acts**2, "b pos f -> f")
-
-        self.neuron_act_counts += einsum((relu_out > 0).float(), (acts > 0).float(),"b pos d, b pos f -> f d")
-        self.act_counts += einsum((acts > 0).float(), "b pos f -> f")
-
-    def set_avg_input_output_quants(self):
-        d_model, d_mlp = self.W_in.shape
         self.pre_relu_mean = nn.Parameter(
                                     torch.zeros((d_mlp), device=self.device),
+                                    requires_grad = False)
+        self.pre_relu_mean_no_act = nn.Parameter(
+                                    torch.zeros((n_feat, d_mlp), device=self.device),
                                     requires_grad = False)
         self.pre_relu_cov = nn.Parameter(
                                     torch.zeros((d_mlp, d_mlp), device=self.device),
@@ -303,32 +298,83 @@ class Midcoder(nn.Module):
         self.mlp_out_mean = nn.Parameter(
                                     torch.zeros((d_model), device=self.device),
                                     requires_grad = False)
+        self.mlp_out_mean_no_act = nn.Parameter(
+                                    torch.zeros((n_feat, d_model), device=self.device),
+                                    requires_grad = False)
         self.mlp_out_cov = nn.Parameter(
-                                    torch.zeros((d_model), device=self.device),
+                                    torch.zeros((d_model, d_model), device=self.device),
                                     requires_grad = False)
 
-        self.quant_count = nn.Parameter(
-                                    torch.zeros((1), device=self.device),
-                                    requires_grad = False)
+    @torch.no_grad()
+    def update_saved_values(self, gate, acts, inputs, outputs):
+        # relu_out: (batch, pos, d_mlp)
+        # acts: (batch, pos, n_feat)
+        self.act_gate_sum += einsum(gate, acts,"b pos d, b pos f -> f d")
+        self.act_sum += einsum(acts, "b pos f -> f")
 
+        self.act_sq_gate_sum += einsum(gate, acts**2,"b pos d, b pos f -> f d")
+        self.act_sq_sum += einsum(acts**2, "b pos f -> f")
 
-    def add_avg_input_output_quants(self, inputs, outputs):
-        pre_relu = inputs @ W_in + b_in
-        self.pre_relu_mean += einsum(pre_relu, "b pos d -> d")
-        self.pre_relu_cov += einsum(pre_relu, pre_relu, "b pos d1, b pos d2 -> d1 d2")
-        self.pre_relu_cube += einsum(pre_relu**3, "b pos d -> d")
+        self.gate_act_counts += einsum(gate, (acts > 0).float(),"b pos d, b pos f -> f d")
+        self.gate_counts += einsum(gate, "b pos f -> f")
+        self.act_counts += einsum((acts > 0).float(), "b pos f -> f")
 
-        self.mlp_out_mean += einsum(outputs, "b pos d -> d")
-        self.mlp_out_cov += einsum(outputs, outputs, "b pos d1, b pos d2 -> d1 d2")
+        batch, pos, d_mlp = gate.shape
+        self.counts += batch * pos
+
+        pre_relu = inputs @ self.W_in + self.b_in
+        self.pre_relu_sum += einsum(pre_relu, "b pos d -> d")
+        self.pre_relu_sum_no_act += einsum(pre_relu, (act <= 0).float(), "b pos d, b pos f-> f d")
+
+        self.pre_relu_cov_sum += einsum(pre_relu, pre_relu, "b pos d1, b pos d2 -> d1 d2")
+        self.pre_relu_cube_sum += einsum(pre_relu**3, "b pos d -> d")
+
+        self.mlp_out_sum += einsum(outputs, "b pos d -> d")
+        self.mlp_out_sum_no_act += einsum(outputs, (act <= 0).float(), "b pos d, b pos f-> f d")
+        self.mlp_out_cov_sum += einsum(outputs, outputs, "b pos d1, b pos d2 -> d1 d2")
+
+    # def set_avg_input_output_quants(self):
+    #     d_model, d_mlp = self.W_in.shape
+    #     self.pre_relu_mean = nn.Parameter(
+    #                                 torch.zeros((d_mlp), device=self.device),
+    #                                 requires_grad = False)
+    #     self.pre_relu_cov = nn.Parameter(
+    #                                 torch.zeros((d_mlp, d_mlp), device=self.device),
+    #                                 requires_grad = False)
+
+    #     self.pre_relu_cube = nn.Parameter(
+    #                                 torch.zeros((d_mlp), device=self.device),
+    #                                 requires_grad = False)
+    #     self.mlp_out_mean = nn.Parameter(
+    #                                 torch.zeros((d_model), device=self.device),
+    #                                 requires_grad = False)
+    #     self.mlp_out_cov = nn.Parameter(
+    #                                 torch.zeros((d_model, d_model), device=self.device),
+    #                                 requires_grad = False)
+
+    #     self.quant_count = nn.Parameter(
+    #                                 torch.zeros((1), device=self.device),
+    #                                 requires_grad = False)
+
+    # @torch.no_grad()
+    # def add_avg_input_output_quants(self, inputs, outputs):
+    #     pre_relu = inputs @ self.W_in + self.b_in
+    #     self.pre_relu_mean += einsum(pre_relu, "b pos d -> d")
+    #     self.pre_relu_cov += einsum(pre_relu, pre_relu, "b pos d1, b pos d2 -> d1 d2")
+    #     self.pre_relu_cube += einsum(pre_relu**3, "b pos d -> d")
+
+    #     self.mlp_out_mean += einsum(outputs, "b pos d -> d")
+    #     self.mlp_out_cov += einsum(outputs, outputs, "b pos d1, b pos d2 -> d1 d2")
         
-        self.quant_count += 1
+    #     batch, pos, d_mlp = pre_relu.shape
+    #     self.quant_count += batch * pos
 
-    def normalize_input_output_quants(self):
-        self.pre_relu_mean /= self.quant_count
-        self.pre_relu_cov /= self.quant_count
-        self.pre_relu_cube /= self.quant_count
-        self.mlp_out_mean /= self.quant_count
-        self.mlp_out_cov /= self.quant_count
+    # def normalize_input_output_quants(self):
+    #     self.pre_relu_mean /= self.quant_count
+    #     self.pre_relu_cov /= self.quant_count
+    #     self.pre_relu_cube /= self.quant_count
+    #     self.mlp_out_mean /= self.quant_count
+    #     self.mlp_out_cov /= self.quant_count
 
         
     def save_weights(self, path):
@@ -338,10 +384,11 @@ class Midcoder(nn.Module):
 
     def load_weights(self, path, **kwargs):
         #assumes weights are first item in list
-        data = torch.load(path)
+        data = torch.load(path, map_location=self.device)
         self.load_state_dict(data['weights'], **kwargs)
 
     def clear_cache(self):
+        gc.collect()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
