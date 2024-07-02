@@ -106,7 +106,7 @@ class Midcoder(nn.Module):
         gate = (mid > 0).float()
         # mlp_out = relu_out @ self.W_out + self.b_out
         # mlp_out = (gate * mid) @ self.W_out + self.b_mid_out
-        mlp_out = (gate * (acts @ self.W_mid)) @ self.W_out + self.b_mid_out
+        mlp_out = (gate * mid) @ self.W_out + self.b_mid_out
         return mlp_out, gate, mid, acts
     
     def get_inputs_outputs(self, token_array):
@@ -125,7 +125,7 @@ class Midcoder(nn.Module):
         mlp_out_trans = acts @ self.W_dec + self.b_dec_out
 
         if self.training:
-            self.update_saved_values(gate, acts, inputs, outputs)
+            self.update_saved_values(gate, acts, mid, inputs, outputs)
 
         mse_mid = nn.MSELoss()(mid, inputs @ self.W_in + self.b_in)
         mse_out = nn.MSELoss()(mlp_out, outputs)
@@ -265,7 +265,7 @@ class Midcoder(nn.Module):
     def initialize_saved_values(self, n_feat, d_model, d_mlp):
         save_feat = self.cfg.saved_features
         self.feat_ids = nn.Parameter(
-                            torch.randint(n_feat, size=save_feat), device=self.device,
+                            torch.randint(n_feat, size=(save_feat,), device=self.device),
                             requires_grad = False)
 
         self.act_gate_sum = nn.Parameter(
@@ -278,6 +278,10 @@ class Midcoder(nn.Module):
                                     torch.zeros((save_feat, save_feat), device=self.device),
                                     requires_grad = False)
 
+        self.act_cov_counts = nn.Parameter(
+                                    torch.zeros((save_feat, save_feat), device=self.device),
+                                    requires_grad = False)
+
         self.act_sq_gate_sum = nn.Parameter(
                                     torch.zeros((save_feat, d_mlp), device=self.device),
                                     requires_grad = False)
@@ -285,12 +289,25 @@ class Midcoder(nn.Module):
                                     torch.zeros((save_feat), device=self.device),
                                     requires_grad = False)
 
+        self.mid_sum = nn.Parameter(
+                                    torch.zeros((d_mlp), device=self.device),
+                                    requires_grad = False)
+
+        self.gate_mid_sum = nn.Parameter(
+                                    torch.zeros((d_mlp), device=self.device),
+                                    requires_grad = False)
+        
         self.gate_act_counts = nn.Parameter(
                                     torch.zeros((save_feat, d_mlp), device=self.device),
                                     requires_grad = False)
+        
         self.gate_counts = nn.Parameter(torch.zeros((d_mlp), device=self.device), requires_grad = False)
+        
         self.act_counts = nn.Parameter(torch.zeros((save_feat), device=self.device), requires_grad = False)
+        
         self.counts = nn.Parameter(torch.zeros((1), device=self.device), requires_grad = False)
+        
+        
         
         self.pre_relu_sum = nn.Parameter(
                                     torch.zeros((d_mlp), device=self.device),
@@ -316,15 +333,15 @@ class Midcoder(nn.Module):
                                     requires_grad = False)
 
     @torch.no_grad()
-    def update_saved_values(self, gate, acts, inputs, outputs):
+    def update_saved_values(self, gate, acts, mid, inputs, outputs):
         # relu_out: (batch, pos, d_mlp)
         # acts: (batch, pos, n_feat)
-        acts = acts[self.feat_ids]
+        acts = acts[:,:,self.feat_ids]
         acts_bool = (acts > 0).float()
         self.act_gate_sum += einsum(gate, acts,"b pos d, b pos f -> f d")
         self.act_sum += einsum(acts, "b pos f -> f")
-        self.act_cov_sum += einsum(acts, "b pos f1, b pos f2 -> f1 f2")
-        self.act_cov_count += einsum(acts_bool, acts_bool, "b pos f1, b pos f2 -> f1 f2")
+        self.act_cov_sum += einsum(acts, acts, "b pos f1, b pos f2 -> f1 f2")
+        self.act_cov_counts += einsum(acts_bool, acts_bool, "b pos f1, b pos f2 -> f1 f2")
 
         self.act_sq_gate_sum += einsum(gate, acts**2,"b pos d, b pos f -> f d")
         self.act_sq_sum += einsum(acts**2, "b pos f -> f")
@@ -332,6 +349,9 @@ class Midcoder(nn.Module):
         self.gate_act_counts += einsum(gate, acts_bool,"b pos d, b pos f -> f d")
         self.gate_counts += einsum(gate, "b pos f -> f")
         self.act_counts += einsum(acts_bool, "b pos f -> f")
+
+        self.mid_sum += einsum(mid, "b pos d -> d")
+        self.gate_mid_sum += einsum(gate, mid, "b pos d, b pos d -> d")
 
         batch, pos, d_mlp = gate.shape
         self.counts += batch * pos
