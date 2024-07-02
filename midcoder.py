@@ -31,6 +31,8 @@ class MidcoderConfig():
     log = True
     wandb_project = 'midcoder'
     device = 'cuda'  
+
+    saved_features = 2000
     
 class Midcoder(nn.Module):
     # finds the mid vectors (pre-ReLU feature vectors) 
@@ -261,47 +263,55 @@ class Midcoder(nn.Module):
 
 
     def initialize_saved_values(self, n_feat, d_model, d_mlp):
+        save_feat = self.cfg.saved_features
+        self.feat_ids = nn.Parameter(
+                            torch.randint(n_feat, size=save_feat), device=self.device,
+                            requires_grad = False)
+
         self.act_gate_sum = nn.Parameter(
-                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    torch.zeros((save_feat, d_mlp), device=self.device),
                                     requires_grad = False)
         self.act_sum = nn.Parameter(
-                                    torch.zeros((n_feat), device=self.device),
+                                    torch.zeros((save_feat), device=self.device),
+                                    requires_grad = False)
+        self.act_cov_sum = nn.Parameter(
+                                    torch.zeros((save_feat, save_feat), device=self.device),
                                     requires_grad = False)
 
         self.act_sq_gate_sum = nn.Parameter(
-                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    torch.zeros((save_feat, d_mlp), device=self.device),
                                     requires_grad = False)
         self.act_sq_sum = nn.Parameter(
-                                    torch.zeros((n_feat), device=self.device),
+                                    torch.zeros((save_feat), device=self.device),
                                     requires_grad = False)
 
         self.gate_act_counts = nn.Parameter(
-                                    torch.zeros((n_feat, d_mlp), device=self.device),
+                                    torch.zeros((save_feat, d_mlp), device=self.device),
                                     requires_grad = False)
         self.gate_counts = nn.Parameter(torch.zeros((d_mlp), device=self.device), requires_grad = False)
-        self.act_counts = nn.Parameter(torch.zeros((n_feat), device=self.device), requires_grad = False)
+        self.act_counts = nn.Parameter(torch.zeros((save_feat), device=self.device), requires_grad = False)
         self.counts = nn.Parameter(torch.zeros((1), device=self.device), requires_grad = False)
         
-        self.pre_relu_mean = nn.Parameter(
+        self.pre_relu_sum = nn.Parameter(
                                     torch.zeros((d_mlp), device=self.device),
                                     requires_grad = False)
-        self.pre_relu_mean_no_act = nn.Parameter(
-                                    torch.zeros((n_feat, d_mlp), device=self.device),
+        self.pre_relu_sum_no_act = nn.Parameter(
+                                    torch.zeros((save_feat, d_mlp), device=self.device),
                                     requires_grad = False)
-        self.pre_relu_cov = nn.Parameter(
+        self.pre_relu_cov_sum = nn.Parameter(
                                     torch.zeros((d_mlp, d_mlp), device=self.device),
                                     requires_grad = False)
 
-        self.pre_relu_cube = nn.Parameter(
+        self.pre_relu_cube_sum = nn.Parameter(
                                     torch.zeros((d_mlp), device=self.device),
                                     requires_grad = False)
-        self.mlp_out_mean = nn.Parameter(
+        self.mlp_out_sum = nn.Parameter(
                                     torch.zeros((d_model), device=self.device),
                                     requires_grad = False)
-        self.mlp_out_mean_no_act = nn.Parameter(
-                                    torch.zeros((n_feat, d_model), device=self.device),
+        self.mlp_out_sum_no_act = nn.Parameter(
+                                    torch.zeros((save_feat, d_model), device=self.device),
                                     requires_grad = False)
-        self.mlp_out_cov = nn.Parameter(
+        self.mlp_out_cov_sum = nn.Parameter(
                                     torch.zeros((d_model, d_model), device=self.device),
                                     requires_grad = False)
 
@@ -309,28 +319,32 @@ class Midcoder(nn.Module):
     def update_saved_values(self, gate, acts, inputs, outputs):
         # relu_out: (batch, pos, d_mlp)
         # acts: (batch, pos, n_feat)
+        acts = acts[self.feat_ids]
+        acts_bool = (acts > 0).float()
         self.act_gate_sum += einsum(gate, acts,"b pos d, b pos f -> f d")
         self.act_sum += einsum(acts, "b pos f -> f")
+        self.act_cov_sum += einsum(acts, "b pos f1, b pos f2 -> f1 f2")
+        self.act_cov_count += einsum(acts_bool, acts_bool, "b pos f1, b pos f2 -> f1 f2")
 
         self.act_sq_gate_sum += einsum(gate, acts**2,"b pos d, b pos f -> f d")
         self.act_sq_sum += einsum(acts**2, "b pos f -> f")
 
-        self.gate_act_counts += einsum(gate, (acts > 0).float(),"b pos d, b pos f -> f d")
+        self.gate_act_counts += einsum(gate, acts_bool,"b pos d, b pos f -> f d")
         self.gate_counts += einsum(gate, "b pos f -> f")
-        self.act_counts += einsum((acts > 0).float(), "b pos f -> f")
+        self.act_counts += einsum(acts_bool, "b pos f -> f")
 
         batch, pos, d_mlp = gate.shape
         self.counts += batch * pos
 
         pre_relu = inputs @ self.W_in + self.b_in
         self.pre_relu_sum += einsum(pre_relu, "b pos d -> d")
-        self.pre_relu_sum_no_act += einsum(pre_relu, (act <= 0).float(), "b pos d, b pos f-> f d")
+        self.pre_relu_sum_no_act += einsum(pre_relu, acts_bool, "b pos d, b pos f-> f d")
 
         self.pre_relu_cov_sum += einsum(pre_relu, pre_relu, "b pos d1, b pos d2 -> d1 d2")
         self.pre_relu_cube_sum += einsum(pre_relu**3, "b pos d -> d")
 
         self.mlp_out_sum += einsum(outputs, "b pos d -> d")
-        self.mlp_out_sum_no_act += einsum(outputs, (act <= 0).float(), "b pos d, b pos f-> f d")
+        self.mlp_out_sum_no_act += einsum(outputs, acts_bool, "b pos d, b pos f-> f d")
         self.mlp_out_cov_sum += einsum(outputs, outputs, "b pos d1, b pos d2 -> d1 d2")
 
     # def set_avg_input_output_quants(self):
