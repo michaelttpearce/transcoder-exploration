@@ -4,7 +4,6 @@ from datasets import load_dataset
 from dataclasses import dataclass
 from utils import tokenize_and_concatenate
 from tqdm import tqdm
-import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -338,6 +337,7 @@ class Midcoder(nn.Module):
         # acts: (batch, pos, n_feat)
         acts = acts[:,:,self.feat_ids]
         acts_bool = (acts > 0).float()
+
         self.act_gate_sum += einsum(gate, acts,"b pos d, b pos f -> f d")
         self.act_sum += einsum(acts, "b pos f -> f")
         self.act_cov_sum += einsum(acts, acts, "b pos f1, b pos f2 -> f1 f2")
