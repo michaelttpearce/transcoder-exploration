@@ -3,7 +3,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from tqdm import tqdm
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR
 from torch.utils.data import DataLoader
 import wandb
 from einops import *
@@ -14,6 +14,7 @@ class FactorizerConfig():
 
     seed: int = 42
     lr = 1e-3
+    min_lr = 1e-6
     weight_decay = 0.0
     batch_size = 1000
     epochs = 100
@@ -21,8 +22,8 @@ class FactorizerConfig():
     wandb_project = 'factorizer'
     device = 'cuda'
 
-    theta = 0.3
-    activation = 'sigmoid'
+    theta = 0.2
+    activation = 'threshold'
     factors = 10000
     decoder_param = 1
     factor_param = 1
@@ -38,8 +39,13 @@ class Factorizer(torch.nn.Module):
         n_feat, d_model = decoders.shape
         # factors = torch.randn(cfg.factors, d_model).to(cfg.device)
         # factors = self.decoders[:cfg.factors]
-        factors = self.decoders[torch.randint(self.decoders.shape[0], size=(self.cfg.factors,))]
+        factors = self.get_init_factors()
         self.factors = torch.nn.Parameter(factors/factors.norm(dim=1,keepdim=True))
+
+    def get_init_factors(self):
+        dec1 = self.decoders[torch.randint(self.decoders.shape[0], size=(self.cfg.factors,))]
+        dec2 = self.decoders[torch.randint(self.decoders.shape[0], size=(self.cfg.factors,))]
+        return dec1 + dec2
 
     def get_factors(self):
         return self.factors / self.factors.norm(dim=1, keepdim=True)
@@ -49,7 +55,7 @@ class Factorizer(torch.nn.Module):
             return nn.functional.tanh((x/self.cfg.theta)**2)
         elif self.cfg.activation=='sigmoid':
             return nn.functional.sigmoid((x-self.cfg.theta)/0.03) + nn.functional.sigmoid(-(x+self.cfg.theta)/0.03)
-        elif self.cfg.activation=='thresh':
+        elif self.cfg.activation=='threshold':
             return (x.abs() > self.cfg.theta).float()
 
     def step(self, batch):
@@ -82,7 +88,7 @@ class Factorizer(torch.nn.Module):
         if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
 
         optimizer = AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=self.cfg.epochs)
+        scheduler = self.get_scheduler()
         dataloader = self.get_dataloader()
                 
         pbar = tqdm(range(self.cfg.epochs))
@@ -108,5 +114,60 @@ class Factorizer(torch.nn.Module):
         if self.cfg.log: wandb.finish()
         return
 
+    def evaluate(self):
+        factors = self.get_factors().detach()
+        acts_orig = self.decoders @ factors.T
+        factors_on = (acts_orig > self.cfg.theta).float()
+
+        decoder_hat = (factors_on * acts_orig) @ factors
+
+        #plot of num factors per decoder direction
+        factors_per_decoder = factors_on.sum(dim=1)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(factors_per_decoder.cpu(), 300)
+        plt.yscale('log')
+        plt.xlabel('Active factors per decoder')
+        plt.ylabel('Counts')
+        plt.title('Factors per decoder')
+
+        #plot of num decoders per factor
+        decoders_per_factor = factors_on.sum(dim=0)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(decoders_per_factor.cpu(), 300)
+        plt.yscale('log')
+        plt.xlabel('Decoders per factor')
+        plt.ylabel('Counts')
+        plt.title('Decoders per factor')
+
+        #plot of cos sims distribution
+        cos_sims = nn.functional.cosine_similarity(self.decoders, decoder_hat, dim=1)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(cos_sims.cpu(), 300)
+        plt.yscale('log')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Counts')
+        plt.title('Decoder vs Reconstruction')
+
+        #plot of err norm
+        err_norm = (decoder - decoder_hat).norm(dim=1)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(err_norm.cpu(), 300)
+        plt.yscale('log')
+        plt.xlabel('Error Norm')
+        plt.ylabel('Counts')
+        plt.title('Decoder vs Reconstruction')
+        
+
+
+
+
     def get_dataloader(self):
         return DataLoader(self.decoders, batch_size=self.cfg.batch_size, shuffle=True)
+
+    def get_scheduler(self, optimizer):
+        gamma = (self.min_lr / self.lr)**(1/epochs)
+        return ExponentialLR(optimizer, gamma)
