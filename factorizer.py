@@ -84,13 +84,13 @@ class Factorizer(torch.nn.Module):
         mask = factor_activity > 0
         factor_sims = factors[mask] @ factors[mask].T
         identity = torch.eye(*factor_sims.shape).to(self.cfg.device)
-        # weight = self.sim_activation(factor_sims)
-        factor_sim_loss =  (factor_sims - identity)**2
+        weight = self.sim_activation(factor_sims)
+        factor_sim_loss =  weight * (factor_sims - identity)**2
         factor_sim_loss = (factor_sim_loss.sum(dim=1)).mean()
 
         L1_loss = acts.abs().sum(dim=1).mean()
         
-        loss = mse_loss + self.cfg.decoder_param * decoder_sim_loss + self.cfg.factor_param * factor_sim_loss + self.l1_param * L1_loss
+        loss = mse_loss + self.cfg.decoder_param * decoder_sim_loss + self.cfg.factor_param * factor_sim_loss + self.cfg.l1_param * L1_loss
 
         return loss, mse_loss, decoder_sim_loss, factor_sim_loss, L1_loss
 
@@ -229,4 +229,5 @@ def plot_factor_activations(factorizer,i):
     plt.title(f'Decoders for Factor {i}')
 
     dec_ids = torch.arange(acts.shape[0]).cuda()[acts[:,i].abs() > 0]
-    print(dec_ids)
+    print(f'Decoder ids: {dec_ids}')
+    print(f'Decoder activations: {acts[dec_ids, i]}')
