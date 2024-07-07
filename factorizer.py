@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from tqdm import tqdm
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR
+from torch.optim import AdamW, SGD
+from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 import wandb
 from einops import *
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 @dataclass
@@ -61,8 +63,8 @@ class Factorizer(torch.nn.Module):
     def step(self, batch):
         batch = batch.to(self.cfg.device)
         factors = self.get_factors()
-        acts = batch @ factors.T
-        acts = self.sim_activation(acts) * acts
+        acts_orig = batch @ factors.T
+        acts = self.sim_activation(acts_orig) * acts_orig
         decoder_hat = acts @ factors
         
         mse_loss = (batch - decoder_hat)**2
@@ -74,11 +76,13 @@ class Factorizer(torch.nn.Module):
         decoder_sim_loss = weight * (decoder_sims - decoder_sims_hat)**2
         decoder_sim_loss = (decoder_sim_loss.sum(dim=1)/(weight*decoder_sims**2).sum(dim=1)).mean()
 
-        factor_sims = factors @ factors.T
+        factor_activity = (acts_orig > self.cfg.theta).sum(dim=0)
+        mask = factor_activity > 0
+        factor_sims = factors[mask] @ factors[mask].T
         identity = torch.eye(*factor_sims.shape).to(self.cfg.device)
         weight = self.sim_activation(factor_sims)
         factor_sim_loss = weight * (factor_sims - identity)**2
-        factor_sim_loss = (factor_sim_loss.sum(dim=1)/(weight*identity**2).sum(dim=1)).mean()
+        factor_sim_loss = (factor_sim_loss.sum(dim=1)/weight.sum(dim=1)).mean()
 
         loss = mse_loss + self.cfg.decoder_param * decoder_sim_loss + self.cfg.factor_param * factor_sim_loss
 
@@ -87,8 +91,9 @@ class Factorizer(torch.nn.Module):
     def fit(self):
         if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
 
-        optimizer = AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
-        scheduler = self.get_scheduler()
+        optimizer = AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
+                        betas=(0.9, 0.95))
+        scheduler = self.get_scheduler(optimizer)
         dataloader = self.get_dataloader()
                 
         pbar = tqdm(range(self.cfg.epochs))
@@ -102,10 +107,13 @@ class Factorizer(torch.nn.Module):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+        
             
             labels = ['loss', 'mse_loss', 'dec sim loss', 'factor loss']
             metrics = {label: sum([step[i] for step in epoch]) / len(epoch) for i, label in enumerate(labels)}
+
+            scheduler.step(metrics['loss'])
+            # metrics['lr':scheduler.get_last_lr()[0]]
 
             if self.cfg.log: wandb.log(metrics)
             history.append(metrics)
@@ -125,7 +133,7 @@ class Factorizer(torch.nn.Module):
         factors_per_decoder = factors_on.sum(dim=1)
 
         plt.figure(figsize=(5,4), dpi=150)
-        plt.hist(factors_per_decoder.cpu(), 300)
+        plt.hist(factors_per_decoder.cpu(), 15)
         plt.yscale('log')
         plt.xlabel('Active factors per decoder')
         plt.ylabel('Counts')
@@ -135,7 +143,7 @@ class Factorizer(torch.nn.Module):
         decoders_per_factor = factors_on.sum(dim=0)
 
         plt.figure(figsize=(5,4), dpi=150)
-        plt.hist(decoders_per_factor.cpu(), 300)
+        plt.hist(decoders_per_factor.cpu(), 30)
         plt.yscale('log')
         plt.xlabel('Decoders per factor')
         plt.ylabel('Counts')
@@ -145,17 +153,17 @@ class Factorizer(torch.nn.Module):
         cos_sims = nn.functional.cosine_similarity(self.decoders, decoder_hat, dim=1)
 
         plt.figure(figsize=(5,4), dpi=150)
-        plt.hist(cos_sims.cpu(), 300)
+        plt.hist(cos_sims.cpu(), 100)
         plt.yscale('log')
         plt.xlabel('Cosine Similarity')
         plt.ylabel('Counts')
         plt.title('Decoder vs Reconstruction')
 
         #plot of err norm
-        err_norm = (decoder - decoder_hat).norm(dim=1)
+        err_norm = (self.decoders - decoder_hat).norm(dim=1)
 
         plt.figure(figsize=(5,4), dpi=150)
-        plt.hist(err_norm.cpu(), 300)
+        plt.hist(err_norm.cpu(), 100)
         plt.yscale('log')
         plt.xlabel('Error Norm')
         plt.ylabel('Counts')
@@ -169,5 +177,54 @@ class Factorizer(torch.nn.Module):
         return DataLoader(self.decoders, batch_size=self.cfg.batch_size, shuffle=True)
 
     def get_scheduler(self, optimizer):
-        gamma = (self.min_lr / self.lr)**(1/epochs)
+        gamma = (self.cfg.min_lr / self.cfg.lr)**(1/self.cfg.epochs)
         return ExponentialLR(optimizer, gamma)
+
+        # return ReduceLROnPlateau(optimizer, threshold=1e-2)
+
+def plot_decoder_reconstruction(factorizer, i):
+    factors = factorizer.get_factors().detach()
+    acts = factorizer.decoders @ factors.T
+    acts = factorizer.sim_activation(acts) * acts
+
+    plt.figure(figsize=(9,4),dpi=150)
+    plt.subplot(1,2,1)
+    plt.hist(acts[i].cpu(),100)
+    plt.yscale('log')
+    plt.xlabel('Factor Cos Sim')
+    plt.ylabel('Count')
+    plt.title(f'Decoder {i}')
+
+    plt.subplot(1,2,2)
+    y = acts[i] @ factors
+    x = factorizer.decoders[i]
+    plt.plot(x.cpu(), y.cpu(), '.', alpha=0.3)
+    vec = np.arange(-0.15, 0.15, 0.01)
+    plt.plot(vec, vec, 'k--')
+    plt.xlabel('Decoder')
+    plt.ylabel('Decoder Reconstruction')
+    plt.title(f'Err norm: {(y-x).norm():.2f}, Cos Sim: {torch.nn.functional.cosine_similarity(x,y,dim=0):.2f}')
+    plt.tight_layout()
+
+    feat_ids = torch.arange(acts.shape[1]).cuda()[acts[i].abs() > 0]
+    print(f'Factor ids: {feat_ids}')
+    print(f'Factor activations: {acts[i,feat_ids]}')
+
+    x = factors[feat_ids]
+    print(f'Factor cosine sims')
+    print(x @ x.T)
+
+def plot_factor_activations(factorizer,i):
+    factors = factorizer.get_factors().detach()
+    acts = factorizer.decoders @ factors.T
+    acts = factorizer.sim_activation(acts) * acts
+    
+    plt.figure(figsize=(5,4),dpi=150)
+    plt.hist(acts[:,i].cpu(),100)
+    plt.yscale('log')
+    plt.xlabel('Activations')
+    plt.ylabel('Count')
+    plt.title(f'Decoders for Factor {i}')
+
+    dec_ids = torch.arange(acts.shape[0]).cuda()[acts[:,i].abs() > 0]
+    print(dec_ids)
