@@ -29,6 +29,10 @@ class FactorizerConfig():
     factors = 10000
     decoder_param = 1
     factor_param = 1
+    l1_param = 0.1
+
+    beta1 = 0.9
+    beta2 = 0.95
 
 
 class Factorizer(torch.nn.Module):
@@ -80,19 +84,21 @@ class Factorizer(torch.nn.Module):
         mask = factor_activity > 0
         factor_sims = factors[mask] @ factors[mask].T
         identity = torch.eye(*factor_sims.shape).to(self.cfg.device)
-        weight = self.sim_activation(factor_sims)
-        factor_sim_loss = weight * (factor_sims - identity)**2
-        factor_sim_loss = (factor_sim_loss.sum(dim=1)/weight.sum(dim=1)).mean()
+        # weight = self.sim_activation(factor_sims)
+        factor_sim_loss =  (factor_sims - identity)**2
+        factor_sim_loss = (factor_sim_loss.sum(dim=1)).mean()
 
-        loss = mse_loss + self.cfg.decoder_param * decoder_sim_loss + self.cfg.factor_param * factor_sim_loss
+        L1_loss = acts.abs().sum(dim=1).mean()
+        
+        loss = mse_loss + self.cfg.decoder_param * decoder_sim_loss + self.cfg.factor_param * factor_sim_loss + self.l1_param * L1_loss
 
-        return loss, mse_loss, decoder_sim_loss, factor_sim_loss
+        return loss, mse_loss, decoder_sim_loss, factor_sim_loss, L1_loss
 
     def fit(self):
         if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
 
         optimizer = AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
-                        betas=(0.9, 0.95))
+                        betas=(self.cfg.beta1, self.cfg.beta2))
         scheduler = self.get_scheduler(optimizer)
         dataloader = self.get_dataloader()
                 
@@ -101,15 +107,15 @@ class Factorizer(torch.nn.Module):
         for _ in pbar:
             epoch = []
             for batch in dataloader:
-                loss, mse_loss, decoder_sim_loss, factor_sim_loss = self.train().step(batch)
-                epoch += [(loss.item(), mse_loss.item(), decoder_sim_loss.item(), factor_sim_loss.item())]
+                loss, mse_loss, decoder_sim_loss, factor_sim_loss, L1_loss = self.train().step(batch)
+                epoch += [(loss.item(), mse_loss.item(), decoder_sim_loss.item(), factor_sim_loss.item(), L1_loss.item())]
                     
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
         
             
-            labels = ['loss', 'mse_loss', 'dec sim loss', 'factor loss']
+            labels = ['loss', 'mse_loss', 'dec sim loss', 'factor loss', 'L1 loss']
             metrics = {label: sum([step[i] for step in epoch]) / len(epoch) for i, label in enumerate(labels)}
 
             scheduler.step(metrics['loss'])
@@ -169,10 +175,6 @@ class Factorizer(torch.nn.Module):
         plt.ylabel('Counts')
         plt.title('Decoder vs Reconstruction')
         
-
-
-
-
     def get_dataloader(self):
         return DataLoader(self.decoders, batch_size=self.cfg.batch_size, shuffle=True)
 
