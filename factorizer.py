@@ -27,7 +27,6 @@ class FactorizerConfig():
     theta = 0.2
     activation = 'threshold'
     factors = 10000
-    decoder_param = 1
     factor_param = 1
     l1_param = 0.1
 
@@ -36,22 +35,26 @@ class FactorizerConfig():
 
 
 class Factorizer(torch.nn.Module):
-    def __init__(self, cfg, decoders):
+    def __init__(self, cfg, inputs):
         super().__init__()
         self.cfg = cfg
-        self.decoders = decoders.detach().to(cfg.device)
-        self.decoders = self.decoders / self.decoders.norm(dim=1, keepdim=True) #[n_feat, d_model]
+        self.inputs = inputs.detach().to(cfg.device)
+        self.inputs = self.inputs / self.inputs.norm(dim=1, keepdim=True) #[n_feat, d_model]
 
-        n_feat, d_model = decoders.shape
+        n_feat, d_model = inputs.shape
         # factors = torch.randn(cfg.factors, d_model).to(cfg.device)
         # factors = self.decoders[:cfg.factors]
-        factors = self.get_init_factors()
-        self.factors = torch.nn.Parameter(factors/factors.norm(dim=1,keepdim=True))
+        factors = self.get_init_factors().to(self.cfg.device)
+        self.factors = nn.Parameter(factors/factors.norm(dim=1,keepdim=True))
+        self.b_pre = nn.Parameter(torch.zeros(d_model).to(self.cfg.device))
 
     def get_init_factors(self):
-        dec1 = self.decoders[torch.randint(self.decoders.shape[0], size=(self.cfg.factors,))]
-        dec2 = self.decoders[torch.randint(self.decoders.shape[0], size=(self.cfg.factors,))]
-        return dec1 + dec2
+        W_dec = self.inputs[torch.randint(self.inputs.shape[0], size=(self.cfg.factors, 20))]
+        W_dec = W_dec.mean(dim=1)
+        W_dec += W_dec.std() * torch.randn(*W_dec.shape).to(W_dec.device)
+        # W_dec = torch.randn(self.cfg.factors, self.inputs.shape[1])
+        W_dec = W_dec / W_dec.norm(dim=1, keepdim=True)
+        return W_dec
 
     def get_factors(self):
         return self.factors / self.factors.norm(dim=1, keepdim=True)
@@ -63,22 +66,15 @@ class Factorizer(torch.nn.Module):
             return nn.functional.sigmoid((x-self.cfg.theta)/0.03) + nn.functional.sigmoid(-(x+self.cfg.theta)/0.03)
         elif self.cfg.activation=='threshold':
             return (x.abs() > self.cfg.theta).float()
-
-    def step(self, batch):
-        batch = batch.to(self.cfg.device)
+    
+    def step(self, x):
         factors = self.get_factors()
-        acts_orig = batch @ factors.T
+        acts_orig = (x - self.b_pre) @ factors.T
         acts = self.sim_activation(acts_orig) * acts_orig
-        decoder_hat = acts @ factors
+        x_hat = acts @ factors + self.b_pre
         
-        mse_loss = (batch - decoder_hat)**2
-        mse_loss = (mse_loss.sum(dim=1) /(batch**2).sum(dim=1)).mean()
-
-        decoder_sims_hat = decoder_hat @ decoder_hat.T
-        decoder_sims = batch @ batch.T
-        weight = self.sim_activation(decoder_sims)
-        decoder_sim_loss = weight * (decoder_sims - decoder_sims_hat)**2
-        decoder_sim_loss = (decoder_sim_loss.sum(dim=1)/(weight*decoder_sims**2).sum(dim=1)).mean()
+        mse_loss = (x - x_hat)**2
+        mse_loss = (mse_loss.sum(dim=1) /(x**2).sum(dim=1)).mean()
 
         factor_activity = (acts_orig > self.cfg.theta).sum(dim=0)
         mask = factor_activity > 0
@@ -90,9 +86,9 @@ class Factorizer(torch.nn.Module):
 
         L1_loss = acts.abs().sum(dim=1).mean()
         
-        loss = mse_loss + self.cfg.decoder_param * decoder_sim_loss + self.cfg.factor_param * factor_sim_loss + self.cfg.l1_param * L1_loss
+        loss = mse_loss + self.cfg.factor_param * factor_sim_loss + self.cfg.l1_param * L1_loss
 
-        return loss, mse_loss, decoder_sim_loss, factor_sim_loss, L1_loss
+        return loss, mse_loss, factor_sim_loss, L1_loss
 
     def fit(self):
         if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
@@ -107,15 +103,14 @@ class Factorizer(torch.nn.Module):
         for _ in pbar:
             epoch = []
             for batch in dataloader:
-                loss, mse_loss, decoder_sim_loss, factor_sim_loss, L1_loss = self.train().step(batch)
-                epoch += [(loss.item(), mse_loss.item(), decoder_sim_loss.item(), factor_sim_loss.item(), L1_loss.item())]
+                loss, mse_loss, factor_sim_loss, L1_loss = self.train().step(batch)
+                epoch += [(loss.item(), mse_loss.item(), factor_sim_loss.item(), L1_loss.item())]
                     
                 optimizer.zero_grad()
                 loss.backward()
-                optimizer.step()
-        
+                optimizer.step()        
             
-            labels = ['loss', 'mse_loss', 'dec sim loss', 'factor loss', 'L1 loss']
+            labels = ['loss', 'mse_loss', 'factor loss', 'L1 loss']
             metrics = {label: sum([step[i] for step in epoch]) / len(epoch) for i, label in enumerate(labels)}
 
             scheduler.step(metrics['loss'])
@@ -130,7 +125,7 @@ class Factorizer(torch.nn.Module):
 
     def evaluate(self):
         factors = self.get_factors().detach()
-        acts_orig = self.decoders @ factors.T
+        acts_orig = self.inputs @ factors.T
         factors_on = (acts_orig > self.cfg.theta).float()
 
         decoder_hat = (factors_on * acts_orig) @ factors
@@ -156,7 +151,7 @@ class Factorizer(torch.nn.Module):
         plt.title('Decoders per factor')
 
         #plot of cos sims distribution
-        cos_sims = nn.functional.cosine_similarity(self.decoders, decoder_hat, dim=1)
+        cos_sims = nn.functional.cosine_similarity(self.inputs, decoder_hat, dim=1)
 
         plt.figure(figsize=(5,4), dpi=150)
         plt.hist(cos_sims.cpu(), 100)
@@ -166,7 +161,7 @@ class Factorizer(torch.nn.Module):
         plt.title('Decoder vs Reconstruction')
 
         #plot of err norm
-        err_norm = (self.decoders - decoder_hat).norm(dim=1)
+        err_norm = (self.inputs - decoder_hat).norm(dim=1)
 
         plt.figure(figsize=(5,4), dpi=150)
         plt.hist(err_norm.cpu(), 100)
@@ -176,7 +171,7 @@ class Factorizer(torch.nn.Module):
         plt.title('Decoder vs Reconstruction')
         
     def get_dataloader(self):
-        return DataLoader(self.decoders, batch_size=self.cfg.batch_size, shuffle=True)
+        return DataLoader(self.inputs, batch_size=self.cfg.batch_size, shuffle=True)
 
     def get_scheduler(self, optimizer):
         gamma = (self.cfg.min_lr / self.cfg.lr)**(1/self.cfg.epochs)
