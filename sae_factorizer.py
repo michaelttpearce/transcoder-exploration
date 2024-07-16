@@ -48,7 +48,8 @@ class FactorizerConfig():
     factors = 10000
     topk = 5
     mse_param = 1
-    factor_thresh = 0.2
+    factor_thresh = 0.15
+    factor_activation = 'tanh'
     factor_sim_param = 1
 
     beta1 = 0.9
@@ -80,19 +81,27 @@ class BaseFactorizer(torch.nn.Module):
     def forward(self, x):
         pass
 
+    def factor_sim_activation(self,x):
+        if self.cfg.factor_activation=='tanh':
+            return nn.functional.tanh((x/self.cfg.factor_thresh)**2)
+        elif self.cfg.factor_activation=='sigmoid':
+            return nn.functional.sigmoid((x-self.cfg.factor_thresh)/0.02) + nn.functional.sigmoid(-(x+self.cfg.theta)/0.02)
+        elif self.cfg.factor_activation=='threshold':
+            return (x.abs() > self.cfg.factor_thresh).float()
+
     def step(self, x):
         x_hat, acts = self.forward(x)
         
         metrics = {}
         mse_loss = (x - x_hat)**2
-        metrics['nmse_loss'] = (mse_loss.sum(dim=1) /(x**2).sum(dim=1)).mean()
+        metrics['nmse_loss'] = (mse_loss.sum(dim=1) / (x**2).sum(dim=1)).mean()
 
         if self.cfg.factor_sim_param > 0:
             factors = self.decoder.weight.T
             active = (acts > 0).sum(dim=0) > 0
             factor_sims = factors[active] @ factors[active].T
             identity = torch.eye(*factor_sims.shape).to(self.cfg.device)
-            weight = (factor_sims > self.cfg.factor_thresh).float()
+            weight = self.factor_sim_activation(factor_sims)
             factor_sim_loss =  weight * (factor_sims - identity)**2
             factor_sim_loss = (factor_sim_loss.sum(dim=1)).mean()
             metrics['factor_sim_loss'] = factor_sim_loss
@@ -100,6 +109,8 @@ class BaseFactorizer(torch.nn.Module):
             factor_sim_loss = 0
 
         metrics['L1'] = acts.abs().sum(dim=1).mean()
+
+        metrics['L0'] = (acts > 0).float().sum(dim=1).mean()
         
         metrics['loss'] = self.cfg.mse_param * mse_loss.sum(dim=1).mean() + self.cfg.factor_sim_param * factor_sim_loss
 
@@ -149,8 +160,9 @@ class BaseFactorizer(torch.nn.Module):
         return ExponentialLR(optimizer, gamma)
     
     def evaluate(self):
-        factors = self.decoder.weight.T.detach()
-        x_hat, acts = self.forward(self.inputs)
+        with torch.no_grad():
+            factors = self.decoder.weight.T.detach()
+            x_hat, acts = self.forward(self.inputs)
 
         #plot of num factors per decoder direction
         factors_per_decoder = (acts > 0).float().sum(dim=1)
@@ -219,6 +231,7 @@ class ThresholdFactorizer(BaseFactorizer):
     def forward(self, x):
         x = x - self.b_pre
         pre_acts = self.encoder(x)
+        # pre_acts = x @ self.decoder.weight
         acts = self.activation(pre_acts) * pre_acts
         x_hat = self.decoder(acts) + self.b_pre
         return x_hat, acts
