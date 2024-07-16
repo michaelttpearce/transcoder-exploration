@@ -61,6 +61,7 @@ class BaseFactorizer(torch.nn.Module):
     def __init__(self, cfg, inputs):
         super().__init__()
         self.cfg = cfg
+        torch.manual_seed(cfg.seed)
         self.inputs = inputs.detach().to(cfg.device)
         self.inputs = self.inputs / self.inputs.norm(dim=-1, keepdim=True) #[n_feat, d_model]
 
@@ -85,7 +86,7 @@ class BaseFactorizer(torch.nn.Module):
         if self.cfg.factor_activation=='tanh':
             return nn.functional.tanh((x/self.cfg.factor_thresh)**2)
         elif self.cfg.factor_activation=='sigmoid':
-            return nn.functional.sigmoid((x-self.cfg.factor_thresh)/0.02) + nn.functional.sigmoid(-(x+self.cfg.theta)/0.02)
+            return nn.functional.sigmoid((x-self.cfg.factor_thresh)/0.02) + nn.functional.sigmoid(-(x+self.cfg.factor_thresh)/0.02)
         elif self.cfg.factor_activation=='threshold':
             return (x.abs() > self.cfg.factor_thresh).float()
 
