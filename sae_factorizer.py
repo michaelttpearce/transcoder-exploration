@@ -33,7 +33,7 @@ class ConstrainedAdam(Adam):
 
 
 @dataclass
-class SAEFactorizerConfig():
+class FactorizerConfig():
 
     seed: int = 42
     lr = 1e-3
@@ -48,13 +48,15 @@ class SAEFactorizerConfig():
     factors = 10000
     topk = 5
     mse_param = 1
+    factor_thresh = 0.2
+    factor_sim_param = 1
 
     beta1 = 0.9
-    beta2 = 0.99
+    beta2 = 0.999
     eps = 1e-8
 
 
-class SAEFactorizer(torch.nn.Module):
+class BaseFactorizer(torch.nn.Module):
     def __init__(self, cfg, inputs):
         super().__init__()
         self.cfg = cfg
@@ -68,32 +70,38 @@ class SAEFactorizer(torch.nn.Module):
         self.encoder.weight = nn.Parameter(W_dec.T)
         self.b_pre = nn.Parameter(torch.zeros(inputs.shape[-1]).to(self.cfg.device))
     
-    def get_init_weights(self, k=5):
-        W_dec = torch.randn(self.cfg.factors, self.inputs.shape[1])
-        # W_dec = self.inputs[torch.randint(self.inputs.shape[0], size=(self.cfg.factors, k))]
-        # W_dec = W_dec.mean(dim=1)
+    def get_init_weights(self):
+        W_dec = self.inputs[torch.randint(self.inputs.shape[0], size=(self.cfg.factors, 20))]
+        W_dec = W_dec.mean(dim=1)
+        W_dec += W_dec.std() * torch.randn(*W_dec.shape).to(W_dec.device)
         W_dec = W_dec / W_dec.norm(dim=1, keepdim=True)
         return W_dec.T
     
     def forward(self, x):
-        x = x - self.b_pre
-        pre_acts = self.encoder(x)
-        topk = torch.topk(pre_acts, k=self.cfg.topk, dim=-1)
-        acts = torch.zeros_like(pre_acts)
-        acts.scatter_(-1, topk.indices, topk.values)
-        x_hat = self.decoder(acts) + self.b_pre
-        return x_hat, acts, topk.indices, topk.values
+        pass
 
     def step(self, x):
-        x_hat, acts, _, _ = self.forward(x)
+        x_hat, acts = self.forward(x)
         
         metrics = {}
         mse_loss = (x - x_hat)**2
         metrics['nmse_loss'] = (mse_loss.sum(dim=1) /(x**2).sum(dim=1)).mean()
 
+        if self.cfg.factor_sim_param > 0:
+            factors = self.decoder.weight.T
+            active = (acts > 0).sum(dim=0) > 0
+            factor_sims = factors[active] @ factors[active].T
+            identity = torch.eye(*factor_sims.shape).to(self.cfg.device)
+            weight = (factor_sims > self.cfg.factor_thresh).float()
+            factor_sim_loss =  weight * (factor_sims - identity)**2
+            factor_sim_loss = (factor_sim_loss.sum(dim=1)).mean()
+            metrics['factor_sim_loss'] = factor_sim_loss
+        else:
+            factor_sim_loss = 0
+
         metrics['L1'] = acts.abs().sum(dim=1).mean()
         
-        metrics['loss'] = mse_loss.sum(dim=1).mean()
+        metrics['loss'] = self.cfg.mse_param * mse_loss.sum(dim=1).mean() + self.cfg.factor_sim_param * factor_sim_loss
 
         self.factor_acts += acts.sum(dim=0)
         return metrics
@@ -139,5 +147,78 @@ class SAEFactorizer(torch.nn.Module):
     def get_scheduler(self, optimizer):
         gamma = (self.cfg.min_lr / self.cfg.lr)**(1/self.cfg.epochs)
         return ExponentialLR(optimizer, gamma)
+    
+    def evaluate(self):
+        factors = self.decoder.weight.T.detach()
+        x_hat, acts = self.forward(self.inputs)
 
-        # return ReduceLROnPlateau(optimizer, threshold=1e-2)
+        #plot of num factors per decoder direction
+        factors_per_decoder = (acts > 0).float().sum(dim=1)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(factors_per_decoder.cpu(), 15)
+        plt.yscale('log')
+        plt.xlabel('Active factors per decoder')
+        plt.ylabel('Counts')
+        plt.title('Factors per decoder')
+
+        #plot of num decoders per factor
+        decoders_per_factor = (acts > 0).float().sum(dim=0)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(decoders_per_factor.cpu(), 30)
+        plt.yscale('log')
+        plt.xlabel('Decoders per factor')
+        plt.ylabel('Counts')
+        plt.title('Decoders per factor')
+
+        #plot of cos sims distribution
+        cos_sims = nn.functional.cosine_similarity(self.inputs, x_hat, dim=1)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(cos_sims.cpu(), 100)
+        plt.yscale('log')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Counts')
+        plt.title('Decoder vs Reconstruction')
+
+        #plot of err norm
+        err_norm = (self.inputs - x_hat).norm(dim=1)
+
+        plt.figure(figsize=(5,4), dpi=150)
+        plt.hist(err_norm.cpu(), 100)
+        plt.yscale('log')
+        plt.xlabel('Error Norm')
+        plt.ylabel('Counts')
+        plt.title('Decoder vs Reconstruction')
+
+
+
+class TopKFactorizer(BaseFactorizer):
+    
+    def forward(self, x):
+        x = x - self.b_pre
+        pre_acts = self.encoder(x)
+        topk = torch.topk(pre_acts, k=self.cfg.topk, dim=-1)
+        acts = torch.zeros_like(pre_acts)
+        acts.scatter_(-1, topk.indices, topk.values)
+        x_hat = self.decoder(acts) + self.b_pre
+        return x_hat, acts
+
+
+class ThresholdFactorizer(BaseFactorizer):
+    
+    def activation(self, x):
+        if self.cfg.activation=='tanh':
+            return nn.functional.tanh((x/self.cfg.theta)**2)
+        elif self.cfg.activation=='sigmoid':
+            return nn.functional.sigmoid((x-self.cfg.theta)/0.03) + nn.functional.sigmoid(-(x+self.cfg.theta)/0.03)
+        elif self.cfg.activation=='threshold':
+            return (x.abs() > self.cfg.theta).float()
+        
+    def forward(self, x):
+        x = x - self.b_pre
+        pre_acts = self.encoder(x)
+        acts = self.activation(pre_acts) * pre_acts
+        x_hat = self.decoder(acts) + self.b_pre
+        return x_hat, acts
