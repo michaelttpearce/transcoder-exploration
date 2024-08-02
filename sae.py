@@ -46,6 +46,7 @@ class SAEConfig():
     epochs = 100
     log = False
     wandb_project = 'meta_sae'
+    run_name = None
     device = 'cuda'
 
     features = 10000
@@ -112,7 +113,13 @@ class BaseSAE(torch.nn.Module):
         return metrics
 
     def fit(self):
-        if self.cfg.log: wandb.init(project=self.cfg.wandb_project, config=self.cfg)
+        if self.cfg.log and (self.cfg.run_name is not None): 
+            wandb.init(project=self.cfg.wandb_project, 
+                                    config=self.cfg,
+                                    name = self.cfg.run_name)
+        elif self.cfg.log:
+            wandb.init(project=self.cfg.wandb_project, 
+                                    config=self.cfg)
 
         optimizer = ConstrainedAdam(self.parameters(), self.decoder.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
                         betas=(self.cfg.beta1, self.cfg.beta2), eps = self.cfg.eps)
