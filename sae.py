@@ -51,9 +51,10 @@ class SAEConfig():
     features = 10000
     topk = 5
     mse_param = 1
+    feature_sim_param = 0
     feature_thresh = 0.15
     feature_activation = 'tanh'
-    feature_sim_param = 1
+    
 
     beta1 = 0.9
     beta2 = 0.999
@@ -64,26 +65,8 @@ class SAEConfig():
 
 
 class BaseSAE(torch.nn.Module):
-    def __init__(self, cfg, inputs):
+    def __init__(self):
         super().__init__()
-        self.cfg = cfg
-        torch.manual_seed(cfg.seed)
-        self.inputs = inputs.detach().to(cfg.device)
-        self.inputs = self.inputs / self.inputs.norm(dim=-1, keepdim=True) #[n_feat, d_model]
-
-        W_dec = self.get_init_weights().to(self.cfg.device)
-        self.decoder = nn.Linear(W_dec.shape[1], W_dec.shape[0], bias=False)
-        self.decoder.weight = nn.Parameter(W_dec)
-        self.encoder = nn.Linear(W_dec.shape[0], W_dec.shape[1], bias=False)
-        self.encoder.weight = nn.Parameter(W_dec.T)
-        self.b_pre = nn.Parameter(torch.zeros(inputs.shape[-1]).to(self.cfg.device))
-    
-    def get_init_weights(self):
-        W_dec = self.inputs[torch.randint(self.inputs.shape[0], size=(self.cfg.features, 20))]
-        W_dec = W_dec.mean(dim=1)
-        W_dec += W_dec.std() * torch.randn(*W_dec.shape).to(W_dec.device)
-        W_dec = W_dec / W_dec.norm(dim=1, keepdim=True)
-        return W_dec.T
     
     def forward(self, x):
         pass
@@ -142,8 +125,7 @@ class BaseSAE(torch.nn.Module):
             epoch = []
             self.feature_acts = torch.zeros(self.cfg.features).to(self.cfg.device) #used to identify dead features at epoch level
 
-            for step in range(steps_per_epoch):
-                batch = next(dataloader)
+            for step, batch in enumerate(dataloader):
                 metrics = self.train().step(batch)
                 loss = metrics['loss']
                 epoch += [{key:val.item() for key, val in metrics.items()}]
@@ -151,6 +133,9 @@ class BaseSAE(torch.nn.Module):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+                if (steps_per_epoch is not None) and (step >= steps_per_epoch-1):
+                    break
             
             labels = epoch[0].keys()
             metrics = {label: sum([step[label] for step in epoch]) / len(epoch) for label in labels}
@@ -168,7 +153,7 @@ class BaseSAE(torch.nn.Module):
         pass
     
     def get_epochs(self, dataloader):
-        return self.cfg.epochs, len(dataloader)
+        return self.cfg.epochs, None
 
     def get_scheduler(self, optimizer):
         gamma = (self.cfg.min_lr / self.cfg.lr)**(1/self.cfg.epochs)
@@ -176,7 +161,7 @@ class BaseSAE(torch.nn.Module):
 
 
 
-class TopKSAE(BaseSAE):
+class BaseTopKSAE(BaseSAE):
     
     def forward(self, x):
         x = x - self.b_pre
@@ -188,7 +173,7 @@ class TopKSAE(BaseSAE):
         return x_hat, acts
   
 
-class MetaSAE(TopKSAE):
+class MetaSAE(BaseTopKSAE):
     def __init__(self, cfg, inputs):
         super().__init__()
         self.cfg = cfg
@@ -211,8 +196,9 @@ class MetaSAE(TopKSAE):
         return W_dec.T #[d_model, meta_features]
     
     def get_dataloader(self):
-        return DataLoader(self.inputs, batch_size=self.cfg.batch_size, shuffle=True)
-    
+        dataloader = DataLoader(self.inputs, batch_size=self.cfg.batch_size, shuffle=True)
+        return dataloader
+
     def evaluate(self):
         with torch.no_grad():
             features = self.decoder.weight.T.detach()
@@ -259,7 +245,7 @@ class MetaSAE(TopKSAE):
         plt.title('Feature vs Reconstruction')
 
 
-class UberSAE(TopKSAE):
+class UberSAE(BaseTopKSAE):
     
     def __init__(self, cfg, model_cfg):
         super().__init__()
