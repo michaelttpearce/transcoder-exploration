@@ -86,29 +86,31 @@ class BaseSAE(torch.nn.Module):
     def step(self, batch):
         x = self.get_inputs(batch)
         x_hat, acts = self.forward(x)
-        self.feature_acts += acts.sum(dim=0)
+
+        dims = tuple(i for i in range(len(acts.shape)-1)) #all but last dim
+        self.feature_acts += acts.sum(dim=dims)
         
         metrics = {}
         mse_loss = (x - x_hat)**2
-        metrics['nmse_loss'] = (mse_loss.sum(dim=1) / (x**2).sum(dim=1)).mean()
+        metrics['nmse_loss'] = (mse_loss.sum(dim=-1) / (x**2).sum(dim=-1)).mean()
 
         if self.cfg.feature_sim_param > 0:
             features = self.decoder.weight.T
-            active = (acts > 0).sum(dim=0) > 0
+            active = (acts > 0).sum(dim=dims) > 0
             feature_sims = features[active] @ features[active].T
             identity = torch.eye(*feature_sims.shape).to(self.cfg.device)
             weight = self.feature_sim_activation(feature_sims)
             feature_sim_loss =  weight * (feature_sims - identity)**2
-            feature_sim_loss = (feature_sim_loss.sum(dim=1)).mean()
+            feature_sim_loss = (feature_sim_loss.sum(dim=-1)).mean()
             metrics['feature_sim_loss'] = feature_sim_loss
         else:
             feature_sim_loss = 0
 
-        metrics['L1'] = acts.abs().sum(dim=1).mean()
+        metrics['L1'] = acts.abs().sum(dim=-1).mean()
 
-        metrics['L0'] = (acts > 0).float().sum(dim=1).mean()
+        metrics['L0'] = (acts > 0).float().sum(dim=-1).mean()
         
-        metrics['loss'] = self.cfg.mse_param * mse_loss.sum(dim=1).mean() + self.cfg.feature_sim_param * feature_sim_loss
+        metrics['loss'] = self.cfg.mse_param * mse_loss.mean() + self.cfg.feature_sim_param * feature_sim_loss
 
         return metrics
 
@@ -121,13 +123,18 @@ class BaseSAE(torch.nn.Module):
             wandb.init(project=self.cfg.wandb_project, 
                                     config=self.cfg)
 
-        optimizer = ConstrainedAdam(self.parameters(), self.decoder.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
+        if self.decoder.weight.requires_grad:
+            optimizer = ConstrainedAdam(self.parameters(), self.decoder.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
                         betas=(self.cfg.beta1, self.cfg.beta2), eps = self.cfg.eps)
+        else:
+            optimizer = Adam(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
+                        betas=(self.cfg.beta1, self.cfg.beta2), eps = self.cfg.eps)
+        
         scheduler = self.get_scheduler(optimizer)
         dataloader = self.get_dataloader()
                 
         num_epochs, steps_per_epoch = self.get_epochs(dataloader)
-        pbar = tqdm(range(self.cfg.epochs))
+        pbar = tqdm(range(num_epochs))
         for _ in pbar:
             epoch = []
             self.feature_acts = torch.zeros(self.cfg.features).to(self.cfg.device) #used to identify dead features at epoch level
@@ -263,41 +270,32 @@ class UberSAE(BaseTopKSAE):
 
         torch.manual_seed(self.cfg.seed)
 
-        W_dec, W_enc = self.get_init_weights().to(self.cfg.device)
+        W_dec, W_enc = self.get_init_weights()
         self.decoder = nn.Linear(W_dec.shape[0], W_dec.shape[1], bias=False)
         self.decoder.weight = nn.Parameter(W_dec.T, requires_grad=False)
+        
         self.encoder = nn.Linear(W_enc.shape[0], W_enc.shape[1], bias=False)
         self.encoder.weight = nn.Parameter(W_enc.T)
+        # self.encoder.weight = nn.Parameter(torch.randn_like(W_enc.T).to(self.device))
 
         self.b_pre = nn.Parameter(torch.zeros(W_enc.shape[0]).to(self.cfg.device))
     
     def get_init_weights(self):
-        sae_dec = self.model_cfg['sae'].W_dec.detach()
-        sae_dec = sae_dec / sae_dec.norm(dim=1, keepdim=True)
-
-        with torch.no_grad():
-            sae_dec_hat, _ = self.model_cfg['meta_sae'].forward(sae_dec)
-            sae_dec_error = sae_dec - sae_dec_hat
-            sae_dec_error = sae_dec_error / sae_dec_error.norm(dim=1, keepdim=True)
-
-        meta_dec = self.model_cfg['meta_sae'].decoder.weight.T.detach() #[meta_features, d_model]
-
-        W_dec = torch.cat([meta_dec, sae_dec_error], dim=0)
-        W_dec = W_dec / W_dec.norm(dim=1, keepdim=True)  #[uber_features, d_model]
-
+        W_dec = self.model_cfg['W_dec']  #[uber_features, d_model]
         W_enc = torch.linalg.pinv(W_dec) #[d_model, uber_features]
-        return W_dec, W_enc #[uber_features, d_model], [d_model, uber_features]
+        self.cfg.features = W_dec.shape[0]
+        return W_dec.to(self.cfg.device), W_enc.to(self.cfg.device) #[uber_features, d_model], [d_model, uber_features]
     
     def get_inputs(self, batch):
         #x: input to model of shape (batch, pos)
         tokens = batch['tokens']
         with torch.no_grad():
             _, cache = self.model_cfg['model'].run_with_cache(tokens, stop_at_layer=self.model_cfg['layer']+1, 
-                                                names_filter=[self.model_cfg['hook_point'].name])
-            inputs = cache[self.hook_point.name]
+                                                names_filter=[self.model_cfg['hook_name']])
+            inputs = cache[self.model_cfg['hook_name']]
         return inputs
     
-    def get_epochs(self):
+    def get_epochs(self, dataloader):
         num_epochs = int(self.cfg.train_tokens/(self.cfg.context_length * self.cfg.batch_size * self.cfg.steps_per_epoch)) + 1
         return num_epochs, self.cfg.steps_per_epoch
     
@@ -315,3 +313,25 @@ class UberSAE(BaseTopKSAE):
             batch_size = self.cfg.batch_size
         dataset = self.get_dataset()
         return iter(DataLoader(dataset, batch_size=batch_size))
+
+
+def define_uber_sae_model_cfg(model, sae, meta_sae, device='cuda'):
+    model_cfg = {'model':model, 
+                 'hook_name': sae.cfg.hook_name,
+                 'layer':sae.cfg.hook_layer}
+
+    sae_dec = sae.W_dec.detach().to(device)
+    sae_dec = sae_dec / sae_dec.norm(dim=1, keepdim=True)
+    with torch.no_grad():
+        sae_dec_hat, _ = meta_sae.forward(sae_dec)
+        sae_dec_error = sae_dec - sae_dec_hat
+        sae_dec_error = sae_dec_error / sae_dec_error.norm(dim=1, keepdim=True)
+    meta_dec = meta_sae.decoder.weight.T.detach().to(device) #[meta_features, d_model]
+
+    W_dec = torch.cat([meta_dec, sae_dec_error], dim=0)
+    model_cfg['W_dec'] = W_dec / W_dec.norm(dim=1, keepdim=True)  #[uber_features, d_model]
+    return model_cfg
+
+
+
+
