@@ -94,13 +94,15 @@ class BaseSAE(torch.nn.Module):
         metrics = {}
         mse_loss = (x - x_hat)**2
         metrics['mse_loss'] = mse_loss.mean()
-
-        err = (x - x_hat).detach()
-        aux_mse_loss = (err - err_hat)**2 if err_hat is not None else 0
-        
-        metrics['aux_mse_loss'] = aux_mse_loss.mean()
         metrics['nmse_loss'] = (mse_loss.sum(dim=-1) / (x**2).sum(dim=-1)).mean()
-        metrics['aux_nmse_loss'] = (aux_mse_loss.sum(dim=-1) / (x**2).sum(dim=-1)).mean()
+
+        if self.cfg.aux_mse_param > 0:
+            err = (x - x_hat).detach()
+            aux_mse_loss = (err - err_hat)**2
+            metrics['aux_mse_loss'] = aux_mse_loss.mean()
+            metrics['aux_nmse_loss'] = (aux_mse_loss.sum(dim=-1) / (x**2).sum(dim=-1)).mean()
+        else:
+            metrics['aux_mse_loss'] = torch.tensor(0)
 
         if self.cfg.feature_sim_param > 0:
             features = self.decoder.weight.T
@@ -112,7 +114,7 @@ class BaseSAE(torch.nn.Module):
             feature_sim_loss = (feature_sim_loss.sum(dim=-1)).mean()
             metrics['feature_sim_loss'] = feature_sim_loss
         else:
-            feature_sim_loss = 0
+            feature_sim_loss = torch.tensor(0)
 
         metrics['L1'] = acts.abs().sum(dim=-1).mean()
 
@@ -194,14 +196,18 @@ class BaseTopKSAE(BaseSAE):
         x_hat = self.decoder(acts) + self.b_pre
         
         if self.cfg.aux_mse_param > 0:
+            # dead_over_batch = ((acts.sum(dim=-1)) == 0).float()
+            # aux_acts = acts * dead_over_batch.unsqueeze(-1)
+            # err_hat = self.decoder(aux_acts)
+
             aux_topk = torch.topk(pre_acts, k=self.cfg.topk + self.cfg.aux_topk, dim=-1)
             aux_acts = torch.zeros_like(pre_acts)
 
-            slice_idxs = torch.arange(self.cfg.topk, self.cfg.topk+self.cfg.aux_topk).to(self.device)
+            slice_idxs = torch.arange(self.cfg.topk, self.cfg.topk+self.cfg.aux_topk).to(self.cfg.device)
             idxs = aux_topk.indices.index_select(-1, slice_idxs)
             vals = aux_topk.values.index_select(-1, slice_idxs)
             aux_acts.scatter_(-1, idxs, vals)
-            err_hat = self.decoder(aux_acts) + self.b_pre
+            err_hat = self.decoder(aux_acts)
         else:
             err_hat = None
         return x_hat, acts, err_hat
@@ -223,9 +229,12 @@ class MetaSAE(BaseTopKSAE):
         self.b_pre = nn.Parameter(torch.zeros(inputs.shape[-1]).to(self.cfg.device))
     
     def get_init_weights(self):
-        W_dec = self.inputs[torch.randint(self.inputs.shape[0], size=(self.cfg.features, 20))]  
-        W_dec = W_dec.mean(dim=1)  #[meta_features, d_model]
-        W_dec += W_dec.std() * torch.randn(*W_dec.shape).to(W_dec.device)
+        # W_dec = self.inputs[torch.randint(self.inputs.shape[0], size=(self.cfg.features, 20))]  
+        # W_dec = W_dec.mean(dim=1)  #[meta_features, d_model]
+        # W_dec += W_dec.std() * torch.randn(*W_dec.shape).to(W_dec.device)
+        # W_dec = W_dec / W_dec.norm(dim=1, keepdim=True)
+
+        W_dec = torch.randn(self.cfg.features, self.inputs.shape[1]).to(self.cfg.device)
         W_dec = W_dec / W_dec.norm(dim=1, keepdim=True)
         return W_dec.T #[d_model, meta_features]
     
