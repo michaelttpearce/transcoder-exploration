@@ -196,22 +196,31 @@ class BaseTopKSAE(BaseSAE):
         x_hat = self.decoder(acts) + self.b_pre
         
         if self.cfg.aux_mse_param > 0:
-            # dead_over_batch = ((acts.sum(dim=-1)) == 0).float()
-            # aux_acts = acts * dead_over_batch.unsqueeze(-1)
-            # err_hat = self.decoder(aux_acts)
-
-            aux_topk = torch.topk(pre_acts, k=self.cfg.topk + self.cfg.aux_topk, dim=-1)
-            aux_acts = torch.zeros_like(pre_acts)
-
-            slice_idxs = torch.arange(self.cfg.topk, self.cfg.topk+self.cfg.aux_topk).to(self.cfg.device)
-            idxs = aux_topk.indices.index_select(-1, slice_idxs)
-            vals = aux_topk.values.index_select(-1, slice_idxs)
-            aux_acts.scatter_(-1, idxs, vals)
-            err_hat = self.decoder(aux_acts)
+            err_hat = self.aux_forward(pre_acts, acts)
         else:
             err_hat = None
         return x_hat, acts, err_hat
-  
+
+    def aux_forward(self, pre_acts, acts):
+        dims = tuple(i for i in range(len(acts.shape)-1)) #all but last dim
+        total_acts = acts.sum(dim=dims)
+        dead_over_batch = (total_acts == 0)
+        aux_pre_acts = pre_acts * dead_over_batch[(None,)*len(dims)]
+
+        topk = torch.topk(aux_pre_acts, k=self.cfg.aux_topk, dim=-1)
+        aux_acts = torch.zeros_like(aux_pre_acts)
+        aux_acts.scatter_(-1, topk.indices, topk.values)
+        err_hat = self.decoder(aux_acts)
+
+        # aux_topk = torch.topk(pre_acts, k=self.cfg.topk + self.cfg.aux_topk, dim=-1)
+        # aux_acts = torch.zeros_like(pre_acts)
+
+        # slice_idxs = torch.arange(self.cfg.topk, self.cfg.topk+self.cfg.aux_topk).to(self.cfg.device)
+        # idxs = aux_topk.indices.index_select(-1, slice_idxs)
+        # vals = aux_topk.values.index_select(-1, slice_idxs)
+        # aux_acts.scatter_(-1, idxs, vals)
+        # err_hat = self.decoder(aux_acts)
+        return err_hat
 
 class MetaSAE(BaseTopKSAE):
     def __init__(self, cfg, inputs):
