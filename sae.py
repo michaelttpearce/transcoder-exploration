@@ -122,7 +122,7 @@ class BaseSAE(torch.nn.Module):
         
         metrics['loss'] = self.cfg.mse_param * metrics['mse_loss'] + self.cfg.aux_mse_param * metrics['aux_mse_loss'] + self.cfg.feature_sim_param * feature_sim_loss
 
-        metrics = self.cfg.add_test_metrics(metrics)
+        metrics = self.add_test_metrics(metrics)
 
         return metrics
 
