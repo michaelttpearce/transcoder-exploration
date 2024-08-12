@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
 from datasets import load_dataset
 from tqdm import tqdm
@@ -91,6 +92,7 @@ class BaseSAE(torch.nn.Module):
         dims = tuple(i for i in range(len(acts.shape)-1)) #all but last dim
         self.feature_acts += acts.sum(dim=dims)
         
+        self.eval()
         metrics = {}
         mse_loss = (x - x_hat)**2
         metrics['mse_loss'] = mse_loss.mean()
@@ -194,38 +196,71 @@ class BaseTopKSAE(BaseSAE):
     
     def forward(self, x):
         x = x - self.b_pre
-        pre_acts = self.encoder(x)
+        pre_acts = F.relu(self.encoder(x))
         topk = torch.topk(pre_acts, k=self.cfg.topk, dim=-1)
         acts = torch.zeros_like(pre_acts)
         acts.scatter_(-1, topk.indices, topk.values)
         x_hat = self.decoder(acts) + self.b_pre
-        
-        if self.cfg.aux_mse_param > 0:
-            err_hat = self.aux_forward(pre_acts, acts)
-        else:
-            err_hat = None
+        err_hat = self.aux_forward(pre_acts, acts)
         return x_hat, acts, err_hat
 
     def aux_forward(self, pre_acts, acts):
-        dims = tuple(i for i in range(len(acts.shape)-1)) #all but last dim
-        total_acts = acts.sum(dim=dims)
-        dead_over_batch = (total_acts == 0)
-        aux_pre_acts = pre_acts * dead_over_batch[(None,)*len(dims)]
+        if self.cfg.aux_mse_param > 0:
+            dims = tuple(i for i in range(len(acts.shape)-1)) #all but last dim
+            total_acts = acts.sum(dim=dims)
+            dead_over_batch = (total_acts == 0)
+            aux_pre_acts = pre_acts * dead_over_batch[(None,)*len(dims)]
 
-        topk = torch.topk(aux_pre_acts, k=self.cfg.aux_topk, dim=-1)
-        aux_acts = torch.zeros_like(aux_pre_acts)
-        aux_acts.scatter_(-1, topk.indices, topk.values)
-        err_hat = self.decoder(aux_acts)
-
-        # aux_topk = torch.topk(pre_acts, k=self.cfg.topk + self.cfg.aux_topk, dim=-1)
-        # aux_acts = torch.zeros_like(pre_acts)
-
-        # slice_idxs = torch.arange(self.cfg.topk, self.cfg.topk+self.cfg.aux_topk).to(self.cfg.device)
-        # idxs = aux_topk.indices.index_select(-1, slice_idxs)
-        # vals = aux_topk.values.index_select(-1, slice_idxs)
-        # aux_acts.scatter_(-1, idxs, vals)
-        # err_hat = self.decoder(aux_acts)
+            k = min(self.cfg.aux_topk, dead_over_batch.sum())
+            topk = torch.topk(aux_pre_acts, k=k, dim=-1)
+            aux_acts = torch.zeros_like(aux_pre_acts)
+            aux_acts.scatter_(-1, topk.indices, topk.values)
+            err_hat = self.decoder(aux_acts)  #no bias for error reconstruction 
+        else:
+            err_hat = None
         return err_hat
+    
+
+class BaseBatchTopkSAE(BaseSAE):
+    def forward(self, x):
+        x = x - self.b_pre
+        pre_acts = F.relu(self.encoder(x))
+
+        if self.training:
+            k = int(self.cfg.topk * pre_acts.shape[0]) #over batch
+            topk = torch.topk(pre_acts.flatten(), k=k, dim=-1)
+            acts = torch.zeros_like(pre_acts.flatten()).scatter(-1, topk.indices, topk.values).reshape(pre_acts.shape)
+            self.update_topk_threshold(acts)
+        else:
+            mask = (pre_acts > self.topk_threshold).float()
+            acts *= mask
+        x_hat = self.decoder(acts) + self.b_pre
+        err_hat = self.aux_forward(pre_acts, acts)
+        
+        return x_hat, acts, err_hat
+    
+    def aux_forward(self, pre_acts, acts):
+        if self.cfg.aux_mse_param > 0:
+            dims = tuple(i for i in range(len(acts.shape)-1)) #all but last dim
+            total_acts = acts.sum(dim=dims)
+            dead_over_batch = (total_acts == 0)
+            aux_pre_acts = pre_acts * dead_over_batch[(None,)*len(dims)]
+
+            k = min(self.cfg.aux_topk, dead_over_batch.sum())
+            topk = torch.topk(aux_pre_acts, k=k, dim=-1)
+            aux_acts = torch.zeros_like(aux_pre_acts)
+            aux_acts.scatter_(-1, topk.indices, topk.values)
+            err_hat = self.decoder(aux_acts)  #no bias for error reconstruction 
+        else:
+            err_hat = None
+        return err_hat
+    
+    def update_topk_threshold(self, acts):
+        z = acts.clone()
+        z[z <= 0] = torch.inf
+        min_acts = z.min(dim=-1).values
+        self.topk_threshold = min_acts[min_acts < torch.inf].mean()
+
 
 class MetaSAE(BaseTopKSAE):
     def __init__(self, cfg, inputs):
