@@ -256,7 +256,7 @@ class BaseBatchTopkSAE(BaseSAE):
         return err_hat
     
     def update_topk_threshold(self, acts):
-        self.topk_threshold = acts[acts>0]..detach().min()
+        self.topk_threshold = acts[acts>0].detach().min()
 
 
 class MetaSAE(BaseTopKSAE):
