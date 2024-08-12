@@ -233,7 +233,7 @@ class BaseBatchTopkSAE(BaseSAE):
             self.update_topk_threshold(acts)
         else:
             mask = (pre_acts > self.topk_threshold).float()
-            acts *= mask
+            acts = pre_acts * mask
         x_hat = self.decoder(acts) + self.b_pre
         err_hat = self.aux_forward(pre_acts, acts)
         
@@ -256,10 +256,7 @@ class BaseBatchTopkSAE(BaseSAE):
         return err_hat
     
     def update_topk_threshold(self, acts):
-        z = acts.clone()
-        z[z <= 0] = torch.inf
-        min_acts = z.min(dim=-1).values
-        self.topk_threshold = min_acts[min_acts < torch.inf].mean()
+        self.topk_threshold = acts[acts>0].min()
 
 
 class MetaSAE(BaseTopKSAE):
